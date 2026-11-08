@@ -322,23 +322,28 @@ const MARKETS = {
   us_index:  { title: "美股指数", num: "04" },
 };
 const STATUS = {
-  above:     { label: "年线上方", cls: "badge-above" },
-  pending:   { label: "年线下方 · 待确认", cls: "badge-pending" },
+  above:     { label: "年线上方", cls: "badge-above",
+               tip: "收盘价 ≥ 年线 MA250（250 个交易日收盘均价，前复权口径）" },
+  pending:   { label: "年线下方 · 待确认", cls: "badge-pending",
+               tip: "收盘价跌破年线，但跌破当日未同时满足「量比>1.5 且 周线MACD死叉」，不计入破位天数" },
   day1:      { label: "破位第 1 天", cls: "badge-day" },
   day2:      { label: "破位第 2 天", cls: "badge-day" },
-  effective: { label: "有效破位", cls: "badge-effective" },
+  effective: { label: "有效破位", cls: "badge-effective",
+               tip: "收盘破位已持续 ≥3 个交易日（确认起点需当日量比>1.5 且周线死叉）" },
 };
 /* 状态词单一出口：兼容 day1..dayN 任意计数，后端词表变化不影响显示 */
 function statusMeta(status) {
   if (!status) return null;
   const m = /^day(\d+)$/.exec(String(status));
-  if (m) return { label: `破位第 ${m[1]} 天`, cls: "badge-day" };
+  if (m) return { label: `破位第 ${m[1]} 天`, cls: "badge-day",
+    tip: `收盘跌破年线且当日量比>1.5、周线MACD死叉——连续第 ${m[1]} 个收盘日破位；满 3 天判定为有效破位` };
   return STATUS[status] || null;
 }
 function statusBadge(status, enabled, extraCls) {
-  if (!enabled) return `<span class="badge badge-above${extraCls ? " " + extraCls : ""}"><span class="dot"></span>已停用</span>`;
-  const s = statusMeta(status) || { label: "等待收盘", cls: "badge-above" };
-  return `<span class="badge ${s.cls}${extraCls ? " " + extraCls : ""}"><span class="dot"></span>${s.label}</span>`;
+  if (!enabled) return `<span class="badge badge-above${extraCls ? " " + extraCls : ""}" data-tip="已停用：不参与监控与收盘确认"><span class="dot"></span>已停用</span>`;
+  const s = statusMeta(status) || { label: "等待收盘", cls: "badge-above",
+    tip: "尚无收盘轮数据，等待第一次收盘确认" };
+  return `<span class="badge ${s.cls}${extraCls ? " " + extraCls : ""}"${s.tip ? ` data-tip="${s.tip}"` : ""}><span class="dot"></span>${s.label}</span>`;
 }
 /* 收盘轮尚未覆盖时，用现价 vs MA250 给出临时徽章（明确标注待确认）；
    检测器收盘确认后自动切换为正式状态徽章 */
@@ -347,30 +352,56 @@ function statusOrProvisional(status, enabled, price, ma250, extraCls) {
   if (status) return statusBadge(status, true, extraCls);
   if (price != null && ma250) {
     return price >= ma250
-      ? `<span class="badge badge-above${extraCls ? " " + extraCls : ""}"><span class="dot"></span>年线上方 · 待收盘确认</span>`
-      : `<span class="badge badge-pending${extraCls ? " " + extraCls : ""}"><span class="dot"></span>年线下方 · 待确认</span>`;
+      ? `<span class="badge badge-above${extraCls ? " " + extraCls : ""}" data-tip="收盘轮尚未覆盖：按现价与年线的即时对比显示，以每日收盘确认为准"><span class="dot"></span>年线上方 · 待收盘确认</span>`
+      : `<span class="badge badge-pending${extraCls ? " " + extraCls : ""}" data-tip="现价在年线下方；是否计入破位天数以收盘确认为准"><span class="dot"></span>年线下方 · 待确认</span>`;
   }
   return statusBadge(null, true, extraCls);
 }
 function macdBadge(weeklyMacd) {
   const dead = weeklyMacd === "dead_cross";
-  return `<span class="badge ${dead ? "badge-pending" : "badge-above"}"><span class="dot"></span>周线${dead ? "死叉" : "未死叉"}</span>`;
+  const tip = dead
+    ? "周线MACD DIF 下穿 DEA——中期动能转弱，是破位确认的必要条件之一"
+    : "周线MACD DIF 在 DEA 上方——中期动能未见转弱";
+  return `<span class="badge ${dead ? "badge-pending" : "badge-above"}" data-tip="${tip}"><span class="dot"></span>周线${dead ? "死叉" : "未死叉"}</span>`;
 }
 const SELL = {
   resistance_stall: "放量滞涨",
   top_divergence: "周线顶背离",
   ma10_break: "跌破10日线",
 };
+const SELL_TIP = {
+  resistance_stall: "现价距年线 ±3% 以内或距 60 日高点 3% 以内，且量比>1.5、当日涨幅<+1%——关键位置放量却不涨",
+  top_divergence: "收盘创 8 周新高，但周线MACD DIF 低于近 8 周峰值——价格新高而动能未跟",
+  ma10_break: "收盘跌破 10 日均线（MA10），且量比>1.5、当日下跌——放量破位下跌",
+};
 const BUY = {
   recross_confirm: "站回年线3日确认",
   ma250_pullback: "回踩年线缩量企稳",
   breakout_high60: "放量突破60日新高",
 };
+const BUY_TIP = {
+  recross_confirm: "收复年线后连续 3 个收盘日站上年线",
+  ma250_pullback: "收盘 ≥ 年线且距其 2% 以内，量比<1.0——缩量回踩不破",
+  breakout_high60: "收盘创 60 日新高 + 量比>1.5 + 站上年线——放量突破",
+};
+function sellBadge(sig) {
+  if (!sig || sig === "none") return "";
+  return `<span class="badge badge-sell" data-tip="${SELL_TIP[sig] || ""}"><span class="dot"></span>止赢 · ${SELL[sig] || sig}</span>`;
+}
 function buyBadge(buy) {
   if (!buy || buy === "none") return "";
-  return `<span class="badge badge-buy"><span class="dot"></span>加仓 · ${BUY[buy] || buy}</span>`;
+  return `<span class="badge badge-buy" data-tip="${BUY_TIP[buy] || ""}"><span class="dot"></span>加仓 · ${BUY[buy] || buy}</span>`;
 }
 /* 短线徽章：日线MACD状态 + RSI 区间组合，青色系 */
+const ST_TIP = {
+  "金叉": "日线MACD DIF > DEA——短线多头状态",
+  "死叉": "日线MACD DIF < DEA——短线空头状态",
+  "超卖": "RSI(14) < 30——短线超卖区",
+  "超买": "RSI(14) > 70——短线超买区",
+};
+function stTipOf(parts) {
+  return parts.map(p => ST_TIP[p]).filter(Boolean).join("；");
+}
 function stBadge(i) {
   if (!i.enabled) return "";
   const parts = [];
@@ -379,7 +410,7 @@ function stBadge(i) {
   if (i.st_rsi === "oversold") parts.push("超卖");
   if (i.st_rsi === "overbought") parts.push("超买");
   if (!parts.length) return "";
-  return `<span class="badge badge-st"><span class="dot"></span>短线 · ${parts.join(" · ")}</span>`;
+  return `<span class="badge badge-st" data-tip="${stTipOf(parts)}"><span class="dot"></span>短线 · ${parts.join(" · ")}</span>`;
 }
 const EVENT_TYPE = t => {
   const map = {
@@ -526,8 +557,7 @@ function itemHTML(i) {
     || (i.buy_signal && i.buy_signal !== "none")
     || i.st_note) ? `
     <div class="item-sell">
-      ${i.sell_signal && i.sell_signal !== "none"
-        ? `<span class="badge badge-sell"><span class="dot"></span>止赢 · ${SELL[i.sell_signal] || i.sell_signal}</span>` : ""}
+      ${sellBadge(i.sell_signal)}
       ${buyBadge(i.buy_signal)}
       ${i.sell_note ? `<span class="sell-note">${esc(i.sell_note)}</span>`
         : i.buy_note ? `<span class="sell-note">${esc(i.buy_note)}</span>`
@@ -978,10 +1008,14 @@ async function loadDetail(id) {
            : { label: "待收盘", cls: "badge-above" }));
     const longParts = [sMeta.label,
       data.item.weekly_macd === "dead_cross" ? "周线死叉" : "周线未死叉"];
+    const longTip = [sMeta.tip,
+      data.item.weekly_macd === "dead_cross"
+        ? "周线MACD DIF 下穿 DEA——中期动能转弱，是破位确认的必要条件之一"
+        : "周线MACD DIF 在 DEA 上方——中期动能未见转弱"].filter(Boolean).join("；");
     const longBadges =
-      `<span class="badge ${sMeta.cls}"><span class="dot"></span>${longParts.join(" · ")}</span>` +
+      `<span class="badge ${sMeta.cls}"${longTip ? ` data-tip="${longTip}"` : ""}><span class="dot"></span>${longParts.join(" · ")}</span>` +
       (data.item.enabled && st.sell_signal && st.sell_signal !== "none"
-        ? `<span class="badge badge-sell"><span class="dot"></span>止赢 · ${SELL[st.sell_signal] || st.sell_signal}</span>`
+        ? sellBadge(st.sell_signal)
         : "") +
       (data.item.enabled ? buyBadge(st.buy_signal) : "") +
       (st.volume_ratio
@@ -998,7 +1032,7 @@ async function loadDetail(id) {
       `<div class="badge-line"><span class="badge-group-label">长线</span>` + longBadges + `</div>` +
       `<div class="badge-line"><span class="badge-group-label st">短线</span>` +
       (stParts.length
-        ? `<span class="badge badge-st"><span class="dot"></span>${stParts.join(" · ")}</span>`
+        ? `<span class="badge badge-st" data-tip="${stTipOf(stParts)}"><span class="dot"></span>${stParts.join(" · ")}</span>`
         : `<span class="badge badge-st"><span class="dot"></span>待收盘评估</span>`) +
       `</div>`;
     hydrateIcons($("#panel-detail"));
@@ -1615,7 +1649,7 @@ function openDetail(id) {
 function initNav() {
   $$("[data-nav]").forEach(b => b.addEventListener("click", () => nav(b.dataset.nav)));
   const h = (location.hash || "").replace("#/", "");
-  if (["dashboard", "watchlist", "logs"].includes(h)) nav(h);
+  if (["dashboard", "watchlist", "logs", "guide"].includes(h)) nav(h);
 }
 
 /* ---------------- change password ---------------- */
@@ -1695,7 +1729,7 @@ async function boot() {
   const h = (location.hash || "").replace("#/", "");
   const isAdmin = me && me.role === "admin";
   $$(".admin-only").forEach(el => { el.hidden = !isAdmin; });
-  const valid = ["dashboard", "watchlist", "logs", ...(isAdmin ? ["admin"] : [])];
+  const valid = ["dashboard", "watchlist", "logs", "guide", ...(isAdmin ? ["admin"] : [])];
   currentNav = valid.includes(h) ? h : "dashboard";
   $$(".panel").forEach(p => p.classList.remove("is-active"));
   $(`#panel-${dm ? "detail" : currentNav}`).classList.add("is-active");
@@ -1763,6 +1797,7 @@ async function refreshCurrent() {
   if (currentNav === "dashboard") await Promise.all([loadDashboard(), loadEvents()]);
   else if (currentNav === "watchlist") await loadWatchlist();
   else if (currentNav === "admin") await loadAdmin();
+  else if (currentNav === "guide") { /* 静态说明页，无需刷新 */ }
   else await loadRuns();
 }
 

@@ -96,6 +96,10 @@
       <span class="rail-num">03</span>
       <span class="rail-label">日志</span>
     </button>
+    <button class="rail-item" data-nav="guide">
+      <span class="rail-num">05</span>
+      <span class="rail-label">说明</span>
+    </button>
     <button class="rail-item admin-only" data-nav="admin" hidden>
       <span class="rail-num">04</span>
       <span class="rail-label">管理</span>
@@ -278,6 +282,61 @@
       </div>
       <div class="term" id="term"></div>
     </section>
+
+    <!-- ============ GUIDE 指标说明 ============ -->
+    <section class="panel" id="panel-guide">
+      <div class="sec-head">
+        <span class="sec-num">05</span>
+        <h2 class="sec-title">指标说明</h2>
+        <span class="sec-desc">判定条件与检测器代码同源 · 界面各处徽章悬停可看速查释义</span>
+      </div>
+      <div class="guide-wrap">
+        <div class="guide-sec">
+          <h3>长线口径</h3>
+          <div class="guide-row"><div class="guide-k">年线 MA250</div><div class="guide-v">最近 <b>250 个交易日收盘价</b>的简单均线（前复权口径）。收盘价在其下方即破位状态的基础事实；列表与详情页展示「距年线」百分比。</div></div>
+          <div class="guide-row"><div class="guide-k">周线 MACD</div><div class="guide-v">对周收盘序列计算 DIF（EMA12−EMA26）与 DEA（DIF 的 EMA9）。<b>死叉 = DIF 下穿 DEA</b>，代表中期动能转弱，是破位确认的必要条件之一。</div></div>
+          <div class="guide-row"><div class="guide-k">量比</div><div class="guide-v">东财口径：当日每分钟平均成交量 ÷ 过去 5 日每分钟平均成交量。<b>1.5 为放量阈值，1.0 为缩量分界</b>，与检测器破位判定同源同口径。</div></div>
+          <div class="guide-row"><div class="guide-k">60 日高点</div><div class="guide-v">最近 60 个交易日内的最高价，用于「放量滞涨」阻力判定与「放量突破 60 日新高」加仓信号。</div></div>
+        </div>
+
+        <div class="guide-sec">
+          <h3>破位状态机（收盘确认制）</h3>
+          <div class="guide-row"><div class="guide-k">盘中</div><div class="guide-v">盘中跌破 / 站回年线只发预警事件，<b>不改变正式状态</b>——一切以收盘价为准，避免盘中噪声。</div></div>
+          <div class="guide-row"><div class="guide-k">跌破当日</div><div class="guide-v">收盘价 &lt; 年线进入破位流程。若同时满足 <b>量比 &gt; 1.5 且 周线 MACD 死叉</b>（确认三要素），当日即记「破位第 1 天」；否则记「年线下方 · 待确认」，不计天数。</div></div>
+          <div class="guide-row"><div class="guide-k">计数</div><div class="guide-v">确认起点后，每个收盘日仍收在年线下方则天数 +1；<b>累计 ≥ 3 个交易日 → 「有效破位」</b>并发事件。</div></div>
+          <div class="guide-row"><div class="guide-k">收复</div><div class="guide-v">收盘回到年线上方 → 状态归零并记「站回年线」事件；此后<b>连续 3 个收盘日</b>站住年线 → 触发加仓信号「站回年线3日确认」。</div></div>
+          <div class="guide-row"><div class="guide-k">状态流转</div><div class="guide-v">年线上方 → 年线下方·待确认 → 破位第 1/2/N 天 → 有效破位；任一破位状态收盘站回年线即回到「年线上方」。</div></div>
+        </div>
+
+        <div class="guide-sec">
+          <h3>止赢信号（收盘评估 · 仅个股）</h3>
+          <div class="guide-row"><div class="guide-k">放量滞涨<span class="guide-pri">优先级 1</span></div><div class="guide-v">现价距年线 <b>±3%</b> 以内<b>或</b>距 60 日高点 <b>3%</b> 以内，且 <b>量比 &gt; 1.5</b>、当日涨幅 <b>&lt; +1%</b>——关键位置放量却不涨。</div></div>
+          <div class="guide-row"><div class="guide-k">周线顶背离<span class="guide-pri">优先级 2</span></div><div class="guide-v">收盘创 <b>8 周新高</b>，但周线 MACD <b>DIF 低于近 8 周峰值</b>——价格新高、动能未跟。</div></div>
+          <div class="guide-row"><div class="guide-k">跌破10日线<span class="guide-pri">优先级 3</span></div><div class="guide-v">收盘 <b>&lt; MA10</b>（含当日的 10 根收盘均值），且 <b>量比 &gt; 1.5</b>、当日下跌——放量跌破短期均线。</div></div>
+          <div class="guide-row"><div class="guide-k">同日多触发</div><div class="guide-v">按优先级显示主信号，其余触发写入备注（「另触发：…」）。</div></div>
+        </div>
+
+        <div class="guide-sec">
+          <h3>加仓信号（收盘评估 · 仅个股）</h3>
+          <div class="guide-row"><div class="guide-k">站回年线3日确认</div><div class="guide-v">收复年线后<b>连续 3 个收盘日</b>站上年线（状态机里程碑，与破位计数互为镜像）。</div></div>
+          <div class="guide-row"><div class="guide-k">回踩年线缩量企稳</div><div class="guide-v">收盘 ≥ 年线且距年线 <b>2%</b> 以内，量比 <b>&lt; 1.0</b>——缩量回踩不破关键位。</div></div>
+          <div class="guide-row"><div class="guide-k">放量突破60日新高</div><div class="guide-v">收盘<b>严格高于此前 60 根收盘</b>，量比 <b>&gt; 1.5</b>，且现价 ≥ 年线。</div></div>
+          <div class="guide-row"><div class="guide-k">优先级</div><div class="guide-v">放量突破60日新高 &gt; 回踩年线缩量企稳；「站回年线3日确认」由状态机独立发出。</div></div>
+        </div>
+
+        <div class="guide-sec">
+          <h3>短线指标（详情页 · 实时）</h3>
+          <div class="guide-row"><div class="guide-k">日线 MACD</div><div class="guide-v">DIF = EMA12 − EMA26，DEA = DIF 的 EMA9（需 ≥ 40 根日K）。<b>DIF &gt; DEA 为金叉（短线多头）</b>，反之为死叉；穿越发生当日会在事件时间线记录「日线MACD金叉/死叉（买点/卖点）」。</div></div>
+          <div class="guide-row"><div class="guide-k">RSI(14)</div><div class="guide-v">14 日相对强弱指数。<b>&lt; 30 超卖，&gt; 70 超买</b>；离开超卖区时记录「超卖修复」事件。</div></div>
+          <div class="guide-row"><div class="guide-k">MA5 / MA10</div><div class="guide-v">最近 5 / 10 根收盘价均值，详情页短线数据面板展示。</div></div>
+        </div>
+
+        <div class="guide-sec">
+          <h3>数据口径</h3>
+          <div class="guide-note">日K统一前复权（东财口径）；SOX 指数无原生数据时以 SMH 代理重标定并在来源中标注。量比与检测器同源。节假日按周末规则近似——法定节假日当天视为闭市，数据冻结、不产生误报。行情/分时在闭市时段显示最近交易日快照，开市自动恢复实时。检测器仅在交易窗口运行：A股与美股收盘后各一次收盘确认轮；所有破位状态以收盘价结算。本系统仅做状态监测与信号提醒，不构成投资建议。</div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <nav class="tabbar" aria-label="底部导航">
@@ -289,6 +348,9 @@
     </button>
     <button class="tab" data-nav="logs">
       <span class="ic" data-icon="terminal"></span><span>日志</span>
+    </button>
+    <button class="tab" data-nav="guide">
+      <span class="ic" data-icon="activity"></span><span>说明</span>
     </button>
     <button class="tab admin-only" data-nav="admin" hidden>
       <span class="ic" data-icon="user"></span><span>管理</span>
