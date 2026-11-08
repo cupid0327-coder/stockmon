@@ -261,6 +261,10 @@ def compute_baseline(secid=None, yahoo_symbol=None, tencent_symbol=None,
                 klines = yahoo_klines(arg)
             elif kind == "tencent":
                 klines = tencent_daily(arg)
+            elif kind == "xueqiu":
+                klines = xueqiu_daily(arg)
+            elif kind == "stooq":
+                klines = stooq_daily(arg)
             else:
                 klines = em_klines(arg)
             break
@@ -495,14 +499,79 @@ def intraday_series(secid, sina_code=None, proxy_secid=None):
             data["preClose"] = round(data["preClose"] * factor, 2)
         data["source"] = proxy_secid.split(".", 1)[-1] + "_proxy_rescaled"
     else:
-        data = _trends2(secid)
-        data["source"] = "eastmoney"
+        try:
+            data = _trends2(secid)
+            data["source"] = "eastmoney"
+        except Exception:
+            data = None
+        if (not data or not data.get("points")) and sina_code:
+            # 东财分时被拒（OCI 机房间歇性）→ 腾讯分时备用源
+            try:
+                data = tencent_intraday(sina_code)
+            except Exception:
+                data = None
+        if data is None:
+            raise BaselineError("分时数据不可用（东财/腾讯均失败）")
     _INTRADAY_CACHE[secid] = (now_m, data)
     return data
 
 
+def tencent_intraday(sina_code):
+    """腾讯分时备用源（东财 trends2 被拒时，覆盖 A股/指数）：
+    {points: [[HH:MM, price]...], preClose, date}"""
+    url = ("https://web.ifzq.gtimg.cn/appstock/app/minute/query?code="
+           + urllib.parse.quote(sina_code))
+    raw = _fetch(url, {"User-Agent": UA}).decode("utf-8", "replace")
+    d = json.loads(raw).get("data") or {}
+    node = d.get(sina_code) or {}
+    dd = (node.get("data") or {}).get("data") or []
+    qt = (node.get("qt") or {}).get(sina_code) or []
+    pts = []
+    for row in dd:
+        f = row.split(" ")
+        if len(f) >= 2:
+            try:
+                hm = f[0]
+                pts.append([hm[:2] + ":" + hm[2:], float(f[1])])
+            except (ValueError, IndexError):
+                continue
+    pre = _f(qt[4]) if len(qt) > 4 else None
+    day = None
+    if len(qt) > 30 and qt[30]:
+        s = str(qt[30])[:8]
+        if len(s) == 8:
+            day = s[:4] + "-" + s[4:6] + "-" + s[6:8]
+    return {"points": pts, "preClose": pre, "date": day, "source": "tencent"}
+
+
+def stooq_daily(symbol, bars=320):
+    """stooq CSV 日K备用源（美股指数/个股）：
+    [{date, close, volume}]。symbol 如 ^dji / ^spx / nvda.us。"""
+    url = ("https://stooq.com/q/d/l/?s=" + urllib.parse.quote(symbol) + "&i=d")
+    raw = _fetch(url, {"User-Agent": UA}).decode("utf-8", "replace")
+    if raw.lstrip().startswith("<"):
+        raise BaselineError("stooq 返回 HTML（被 JS 挑战拦截）")
+    lines = [ln for ln in raw.strip().splitlines() if ln]
+    if len(lines) < 2 or not lines[0].lower().startswith("date"):
+        raise BaselineError("stooq 数据格式异常")
+    out = []
+    for line in lines[1:]:
+        f = line.split(",")
+        if len(f) < 6:
+            continue
+        try:
+            out.append({"date": f[0], "close": float(f[4]),
+                        "volume": float(f[5] or 0)})
+        except ValueError:
+            continue
+    out.sort(key=lambda b: b["date"])
+    if len(out) < 30:
+        raise BaselineError(f"stooq 数据不足（{len(out)}行）")
+    return out
+
+
 def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
-                 xueqiu_symbol=None, bars=140):
+                 xueqiu_symbol=None, stooq_symbol=None, bars=140):
     """Recent daily closes for the detail chart. SOX goes Yahoo-first, then
     the SMH proxy rescaled into index scale (same calibre as the baseline).
     Cached 5 min — the chart is daily data."""
@@ -543,7 +612,13 @@ def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
             except Exception:
                 kl = None
         if kl is None:
-            raise BaselineError("SOX 日K不可用（雅虎/东财SMH/腾讯SMH/雪球均失败）")
+            try:
+                kl = stooq_daily("^sox")
+                source = "stooq_sox"
+            except Exception:
+                kl = None
+        if kl is None:
+            raise BaselineError("SOX 日K不可用（雅虎/东财SMH/腾讯SMH/雪球/stooq均失败）")
     else:
         kl, source = None, None
         try:
@@ -563,8 +638,14 @@ def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
                 source = "xueqiu"
             except Exception:
                 kl = None
+        if kl is None and stooq_symbol:
+            try:
+                kl = stooq_daily(stooq_symbol)
+                source = "stooq"
+            except Exception:
+                kl = None
         if kl is None:
-            raise BaselineError("日K数据不可用（东财/腾讯/雪球均失败）")
+            raise BaselineError("日K数据不可用（东财/腾讯/雪球/stooq均失败）")
     out = {"bars": [{"date": b["date"], "close": b["close"],
                      "volume": b.get("volume") or 0}
                     for b in kl[-bars:]],

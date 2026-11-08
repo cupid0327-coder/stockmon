@@ -450,8 +450,12 @@ def backdrop(user=Depends(current_user), conn=Depends(get_conn)):
                 r["code"], r["secid"], r["sina_code"])
             tsym = baseline_gen.tencent_symbol_for(r["market"], r["code"],
                                                    r["secid"], r["sina_code"])
+            ssym = {"DJI": "^dji", "SPX": "^spx", "SOX": "^sox"}.get(
+                r["code"].upper()) if r["market"] == "us_index" else (
+                r["code"].lower() + ".us") if r["market"] == "us_stock" else None
             data = baseline_gen.daily_closes(secid, sina_code=sina,
-                                             proxy_secid=proxy, tencent_symbol=tsym)
+                                             proxy_secid=proxy, tencent_symbol=tsym,
+                                             stooq_symbol=ssym)
             closes = [b["close"] for b in data["bars"]][-90:]
             if len(closes) < 20:
                 continue
@@ -614,9 +618,13 @@ def instrument_kline(instrument_id: int, user=Depends(current_user),
         row["code"], row["secid"], row["sina_code"])
     tsym = baseline_gen.tencent_symbol_for(row["market"], row["code"],
                                            row["secid"], row["sina_code"])
+    ssym = {"DJI": "^dji", "SPX": "^spx", "SOX": "^sox"}.get(
+        row["code"].upper()) if row["market"] == "us_index" else (
+        row["code"].lower() + ".us") if row["market"] == "us_stock" else None
     try:
         data = baseline_gen.daily_closes(secid, sina_code=sina,
-                                         proxy_secid=proxy, tencent_symbol=tsym)
+                                         proxy_secid=proxy, tencent_symbol=tsym,
+                                         stooq_symbol=ssym)
     except Exception as e:
         raise HTTPException(502, f"日K数据源请求失败：{e}")
     # short-term indicators off the same closes (detector's own functions —
