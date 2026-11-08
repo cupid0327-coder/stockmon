@@ -1,0 +1,10 @@
+# 运行时数据（SQLite/基线/检测器状态）——备份它，但不要提交它
+webapp/data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 工具目录
+.zcode/

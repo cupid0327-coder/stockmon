@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0c">
+<title>STOCKMON — 年线破位监控</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ff5449' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 12h-4l-3 9L9 3l-3 9H2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+
+<canvas id="bg" aria-hidden="true"></canvas>
+<div class="grain" aria-hidden="true"></div>
+<div class="alert-veil" aria-hidden="true"></div>
+
+<!-- ================= AUTH ================= -->
+<section id="view-auth" class="view-auth">
+  <div class="auth-grid">
+    <header class="auth-brand">
+      <div class="brand-row">
+        <span class="brand-glyph" data-icon="radar"></span>
+        <span class="brand-kicker">ANNUAL-LINE BREAKDOWN MONITOR</span>
+      </div>
+      <h1 class="brand-title">
+        <span class="t-solid">STOCK</span><span class="t-outline">MON</span>
+      </h1>
+      <p class="brand-sub">年线破位 · 止赢信号 · 全自动监控终端</p>
+    </header>
+
+    <div class="auth-panel">
+      <div class="auth-tabs" role="tablist">
+        <button type="button" class="auth-tab is-active" data-auth="login">登录</button>
+        <button type="button" class="auth-tab" data-auth="register">注册</button>
+        <span class="tab-ink" aria-hidden="true"></span>
+      </div>
+
+      <form id="auth-form" novalidate>
+        <label class="field">
+          <span class="field-label" data-icon="user"></span>
+          <input name="username" type="text" placeholder="账号（3-32位字母数字）"
+                 autocomplete="username" required minlength="3" maxlength="32">
+          <i class="field-line" aria-hidden="true"></i>
+        </label>
+        <label class="field">
+          <span class="field-label" data-icon="lock"></span>
+          <input name="password" type="password" placeholder="密码（至少 8 位）"
+                 autocomplete="current-password" required minlength="8">
+          <i class="field-line" aria-hidden="true"></i>
+        </label>
+        <p id="auth-error" class="auth-error" hidden></p>
+        <button id="auth-submit" class="btn-magnetic" type="submit">
+          <span id="auth-submit-label">进入系统</span>
+          <span class="btn-arrow" data-icon="arrow-right"></span>
+        </button>
+      </form>
+
+      <p class="auth-foot">数据来源：新浪财经 / 东方财富 / 雅虎财经<br>所有信号仅供参考，不构成投资建议</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= APP ================= -->
+<div id="view-app" hidden>
+  <header class="topbar">
+    <div class="topbar-brand">
+      <span class="brand-glyph sm" data-icon="radar"></span>
+      <span class="tb-name">STOCK<span class="t-outline">MON</span></span>
+    </div>
+    <div class="ticker" id="ticker" hidden>
+      <div class="ticker-track" id="ticker-track"></div>
+    </div>
+    <div class="topbar-actions">
+      <button id="btn-refresh" class="icon-btn" title="刷新数据" aria-label="刷新数据">
+        <span class="ic" data-icon="refresh-cw"></span>
+      </button>
+      <button id="btn-password" class="icon-btn" title="修改密码" aria-label="修改密码">
+        <span class="ic" data-icon="lock"></span>
+      </button>
+      <button id="btn-logout" class="icon-btn" title="退出登录" aria-label="退出登录">
+        <span class="ic" data-icon="log-out"></span>
+      </button>
+    </div>
+  </header>
+
+  <nav class="rail" aria-label="主导航">
+    <button class="rail-item is-active" data-nav="dashboard">
+      <span class="rail-num">01</span>
+      <span class="rail-label">仪表盘</span>
+    </button>
+    <button class="rail-item" data-nav="watchlist">
+      <span class="rail-num">02</span>
+      <span class="rail-label">自选</span>
+    </button>
+    <button class="rail-item" data-nav="logs">
+      <span class="rail-num">03</span>
+      <span class="rail-label">日志</span>
+    </button>
+    <button class="rail-item admin-only" data-nav="admin" hidden>
+      <span class="rail-num">04</span>
+      <span class="rail-label">管理</span>
+    </button>
+  </nav>
+
+  <main class="main" id="main">
+    <!-- ============ DASHBOARD ============ -->
+    <section class="panel is-active" id="panel-dashboard">
+      <div class="hero" id="hero">
+        <div class="hero-meta">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span id="hero-meta-text">系统监测中</span>
+        </div>
+        <div class="hero-title" id="hero-title">加载中</div>
+        <div class="hero-sub" id="hero-sub"></div>
+      </div>
+      <div class="seg filter-seg" id="dash-filter" role="radiogroup">
+        <button type="button" class="seg-btn is-active" data-filter="all">全部</button>
+        <button type="button" class="seg-btn" data-filter="cn_stock">A股</button>
+        <button type="button" class="seg-btn" data-filter="cn_index">A股指数</button>
+        <button type="button" class="seg-btn" data-filter="us_stock">美股</button>
+        <button type="button" class="seg-btn" data-filter="us_index">美股指数</button>
+      </div>
+      <div id="dash-groups"></div>
+      <div id="dash-empty-note" class="empty-state" hidden>该市场暂无自选 —— 去自选页添加</div>
+      <div class="sec-head tl-head">
+        <span class="sec-num">TIMELINE</span>
+        <h2 class="sec-title">事件时间线</h2>
+      </div>
+      <ol class="timeline" id="timeline"></ol>
+    </section>
+
+    <!-- ============ WATCHLIST ============ -->
+    <section class="panel" id="panel-watchlist">
+      <div class="sec-head">
+        <span class="sec-num">02</span>
+        <h2 class="sec-title">自选维护</h2>
+        <span class="sec-desc">添加后自动解析代码并计算年线与周线MACD</span>
+      </div>
+
+      <form class="add-panel" id="add-form">
+        <div class="seg" id="market-seg" role="radiogroup">
+          <button type="button" class="seg-btn is-active" data-market="cn_stock">A股</button>
+          <button type="button" class="seg-btn" data-market="cn_index">A股指数</button>
+          <button type="button" class="seg-btn" data-market="us_stock">美股</button>
+          <button type="button" class="seg-btn" data-market="us_index">美股指数</button>
+        </div>
+        <div id="index-chips" class="chips" hidden></div>
+        <div class="add-row">
+          <input id="add-code" class="add-code" type="text" placeholder="输入代码，如 600000 / 002008 / NVDA / SOX"
+                 autocomplete="off" spellcheck="false">
+          <button class="btn-magnetic sm" type="submit" id="add-submit">
+            <span class="ic" data-icon="plus"></span><span>添加</span>
+          </button>
+        </div>
+        <div id="add-result" class="add-result" hidden></div>
+      </form>
+
+      <div id="wl-list" class="wl-list"></div>
+    </section>
+
+    <!-- ============ DETAIL ============ -->
+    <section class="panel" id="panel-detail">
+      <div class="detail-head">
+        <button id="detail-back" class="icon-btn" title="返回" aria-label="返回">
+          <span class="ic rot180" data-icon="arrow-right"></span>
+        </button>
+        <div class="detail-title">
+          <span class="item-name" id="d-name"></span>
+          <span class="item-code" id="d-code"></span>
+        </div>
+      </div>
+
+      <div class="hero d-hero">
+        <div class="hero-meta" id="d-meta"></div>
+        <div class="d-price-line">
+          <span class="hero-title d-price" id="d-price">--</span>
+          <span class="d-chg num" id="d-chg"></span>
+        </div>
+        <div class="d-dist-line">
+          <span class="hero-title d-dist num" id="d-dist"></span>
+          <span class="d-dist-cap">距年线</span>
+        </div>
+      </div>
+
+      <div class="badge-row" id="d-badges"></div>
+
+      <div class="sec-head">
+        <span class="sec-num">INFO</span>
+        <h2 class="sec-title">股票信息</h2>
+      </div>
+      <div class="d-stats" id="d-stats-info"></div>
+
+      <div class="sec-head">
+        <span class="sec-num lt">LT</span>
+        <h2 class="sec-title">长线数据</h2>
+        <span class="sec-desc">年线 · 量比 · 估值 · 市值</span>
+      </div>
+      <div class="d-stats lt-grid" id="d-stats-lt"></div>
+
+      <div class="sec-head">
+        <span class="sec-num st">ST</span>
+        <h2 class="sec-title">短线数据</h2>
+        <span class="sec-desc">日线MACD · RSI(14) · 短期均线</span>
+      </div>
+      <div class="d-stats st-grid" id="d-st-stats"></div>
+
+      <div class="sec-head">
+        <span class="sec-num st">RT</span>
+        <h2 class="sec-title">分时 · 实时</h2>
+        <span class="sec-desc" id="d-intraday-cap"></span>
+      </div>
+      <div class="chart-wrap intraday-wrap">
+        <canvas id="d-intraday"></canvas>
+        <div id="intraday-tip" class="chart-tip" hidden></div>
+      </div>
+
+      <div class="sec-head">
+        <span class="sec-num">K</span>
+        <h2 class="sec-title">日线 · 收盘</h2>
+        <span class="sec-desc">近 140 个交易日</span>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="d-chart"></canvas>
+        <div id="chart-tip" class="chart-tip" hidden></div>
+        <p class="chart-cap" id="d-chart-cap"></p>
+      </div>
+
+      <div class="sec-head tl-head">
+        <span class="sec-num">TIMELINE</span>
+        <h2 class="sec-title">事件时间线</h2>
+      </div>
+      <ol class="timeline" id="d-timeline"></ol>
+    </section>
+
+    <!-- ============ ADMIN ============ -->
+    <section class="panel" id="panel-admin">
+      <div class="sec-head">
+        <span class="sec-num">04</span>
+        <h2 class="sec-title">用户管理</h2>
+        <span class="sec-desc">新注册用户需在这里审核通过后才能登录</span>
+      </div>
+      <div id="admin-list" class="wl-list"></div>
+
+      <div class="sec-head">
+        <span class="sec-num lt">MAIL</span>
+        <h2 class="sec-title">邮件通知 SMTP</h2>
+        <span class="sec-desc">保存后全局生效 · 测试发送到你在「账号设置」里填的通知邮箱</span>
+      </div>
+      <form id="mail-form" class="add-panel" novalidate>
+        <div class="mail-grid">
+          <label class="mf"><span>SMTP 服务器</span>
+            <input name="host" type="text" placeholder="如 smtp.qq.com" autocomplete="off"></label>
+          <label class="mf"><span>端口</span>
+            <input name="port" type="text" placeholder="465" autocomplete="off"></label>
+          <label class="mf"><span>加密方式</span>
+            <select name="tls"><option value="ssl">SSL (465)</option><option value="starttls">STARTTLS (587)</option></select></label>
+          <label class="mf"><span>账号</span>
+            <input name="user" type="text" placeholder="发件邮箱账号" autocomplete="off"></label>
+          <label class="mf"><span>授权码 / 密码</span>
+            <input name="passwd" type="password" placeholder="留空保持已保存的密码" autocomplete="new-password"></label>
+          <label class="mf"><span>发件人</span>
+            <input name="mail_from" type="text" placeholder="默认同账号" autocomplete="off"></label>
+        </div>
+        <div class="email-actions">
+          <button id="mail-save" class="btn-magnetic sm" type="button"><span>保存配置</span></button>
+          <button id="mail-test" class="btn-magnetic sm" type="button"><span>发送测试邮件</span></button>
+        </div>
+        <p id="mail-msg" class="auth-error" hidden></p>
+      </form>
+    </section>
+
+    <!-- ============ LOGS ============ -->
+    <section class="panel" id="panel-logs">
+      <div class="sec-head">
+        <span class="sec-num">03</span>
+        <h2 class="sec-title">系统日志</h2>
+        <span class="sec-desc">检测器每 5 分钟运行一次，仅在交易窗口内唤醒</span>
+      </div>
+      <div class="term" id="term"></div>
+    </section>
+  </main>
+
+  <nav class="tabbar" aria-label="底部导航">
+    <button class="tab is-active" data-nav="dashboard">
+      <span class="ic" data-icon="layout-dashboard"></span><span>仪表盘</span>
+    </button>
+    <button class="tab" data-nav="watchlist">
+      <span class="ic" data-icon="list"></span><span>自选</span>
+    </button>
+    <button class="tab" data-nav="logs">
+      <span class="ic" data-icon="terminal"></span><span>日志</span>
+    </button>
+    <button class="tab admin-only" data-nav="admin" hidden>
+      <span class="ic" data-icon="user"></span><span>管理</span>
+    </button>
+  </nav>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<div id="pw-dialog" class="modal-overlay" hidden>
+    <div class="modal-card">
+    <div class="modal-head">
+      <h3>账号设置</h3>
+      <button id="pw-close" class="icon-btn" aria-label="关闭">
+        <span class="ic" data-icon="x"></span>
+      </button>
+    </div>
+    <form id="pw-form" novalidate>
+      <h4 class="modal-sec-title">修改密码</h4>
+      <label class="field">
+        <span class="field-label" data-icon="lock"></span>
+        <input name="old_password" type="password" placeholder="当前密码" autocomplete="current-password" required>
+        <i class="field-line" aria-hidden="true"></i>
+      </label>
+      <label class="field">
+        <span class="field-label" data-icon="lock"></span>
+        <input name="new_password" type="password" placeholder="新密码（至少 8 位）" autocomplete="new-password" required minlength="8">
+        <i class="field-line" aria-hidden="true"></i>
+      </label>
+      <label class="field">
+        <span class="field-label" data-icon="lock"></span>
+        <input name="confirm" type="password" placeholder="确认新密码" autocomplete="new-password" required minlength="8">
+        <i class="field-line" aria-hidden="true"></i>
+      </label>
+      <p id="pw-error" class="auth-error" hidden></p>
+      <button class="btn-magnetic" type="submit"><span>确认修改</span></button>
+    </form>
+    <div class="modal-divider"></div>
+    <form id="email-form" novalidate>
+      <h4 class="modal-sec-title">邮件通知</h4>
+      <p class="modal-hint">信号触发（破位/止赢/加仓/短线买卖点）时发送邮件提醒</p>
+      <label class="field">
+        <span class="field-label" data-icon="mail"></span>
+        <input name="notify_email" type="text" placeholder="通知邮箱（留空关闭邮件提醒）" autocomplete="off">
+        <i class="field-line" aria-hidden="true"></i>
+      </label>
+      <div class="email-actions">
+        <button id="email-save" class="btn-magnetic sm" type="button"><span>保存邮箱</span></button>
+        <button id="email-test" class="btn-magnetic sm" type="button"><span>发送测试邮件</span></button>
+      </div>
+      <p id="email-msg" class="auth-error" hidden></p>
+    </form>
+  </div>
+</div>
+
+<script src="/static/icons.js?v=3"></script>
+<script src="/static/app.js?v=3"></script>
+</body>
+</html>
