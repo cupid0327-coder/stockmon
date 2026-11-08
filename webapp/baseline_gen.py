@@ -29,9 +29,27 @@ def _f(s):
 
 
 def _fetch(url, headers=None, timeout=12):
+    """urllib 优先；失败时回退系统 curl——两者 TLS 指纹不同，
+    部分数据源 WAF（如东财）会按指纹断连，curl 路径实测可绕过。"""
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    last_err = None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except Exception as e:
+        last_err = e
+    import subprocess
+    cmd = ["curl", "-s", "-m", str(max(5, timeout)), "--compressed", "-L"]
+    for k, v in (headers or {}).items():
+        cmd += ["-H", f"{k}: {v}"]
+    cmd.append(url)
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout + 5)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout
+    except Exception:
+        pass
+    raise last_err
 
 
 def _em_quote(secid):

@@ -17,11 +17,20 @@ _US_RE = re.compile(r'hq_str_gb_([a-z0-9$]+)="([^"]*)"')
 
 
 def _fetch(url):
-    req = urllib.request.Request(
-        url, headers={"Referer": "https://finance.sina.com.cn/",
-                      "User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=8) as r:
-        return r.read().decode("gbk", "replace")
+    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": UA}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.read().decode("gbk", "replace")
+    except Exception:
+        pass
+    # urllib 被数据源 WAF 断连时回退系统 curl（TLS 指纹不同）
+    import subprocess
+    cmd = ["curl", "-s", "-m", "10", "--compressed",
+           "-H", "Referer: https://finance.sina.com.cn/", "-H", f"User-Agent: {UA}",
+           url]
+    r = subprocess.run(cmd, capture_output=True, timeout=15)
+    return r.stdout.decode("gbk", "replace")
 
 
 def _f(s):
