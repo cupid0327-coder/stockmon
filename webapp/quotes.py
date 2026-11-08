@@ -112,12 +112,35 @@ def _parse_em_fundamentals(raw, secids):
     return out
 
 
+def _snap_save(market, data):
+    """行情快照落库（闭市回放基本面/收盘价；60s 节流）。"""
+    if not data:
+        return
+    try:
+        from . import baseline_gen
+        baseline_gen._blob_save("quotes:" + market, data, min_interval=60)
+    except Exception:
+        pass
+
+
+def market_snapshot(market):
+    """库内最近一次行情快照（{code: {...}}），无记录返回 {}。"""
+    try:
+        from . import baseline_gen
+        got = baseline_gen._blob_load("quotes:" + market, max_age=30 * 86400)
+        return got[0] if got else {}
+    except Exception:
+        return {}
+
+
 def fetch_quotes(instruments):
     """instruments: rows with market/code/sina_code/secid.
     Returns ({code: {price, day_change_pct, time, ...fundamentals}},
     partial_failed)."""
     cn = [r for r in instruments if not str(r["market"]).startswith("us_")]
     us = [r for r in instruments if str(r["market"]).startswith("us_")]
+    cn_codes = {str(r["code"]) for r in cn}
+    us_codes = {str(r["code"]) for r in us}
     quotes, partial = {}, False
 
     if cn:
@@ -162,4 +185,7 @@ def fetch_quotes(instruments):
         except Exception:
             partial = True
 
+    # 快照落库（含基本面），闭市时 /api/quotes 直接回放
+    _snap_save("cn", {c: quotes[c] for c in cn_codes if c in quotes})
+    _snap_save("us", {c: quotes[c] for c in us_codes if c in quotes})
     return quotes, partial

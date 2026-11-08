@@ -603,15 +603,29 @@ def get_quotes(user=Depends(current_user), conn=Depends(get_conn)):
         "WHERE user_id = ? AND enabled = 1", (user["id"],)).fetchall()
     if not rows:
         return {"quotes": {}, "partial": False}
-    # 闭市市场跳过：价格冻结，返回空让前端保留现值
+    # 开市实时拉；闭市回放库内快照（基本面/收盘价冻结，不再打数据源）。
+    # 冷库（尚无快照）时闭市也拉一次兜底并顺势落库。
     cn_open = baseline_gen.cn_market_open()
     us_open = baseline_gen.us_market_open()
-    rows = [r for r in rows
-            if (us_open if str(r["market"]).startswith("us_") else cn_open)]
-    if not rows:
-        return {"quotes": {}, "closed": True, "partial": False}
-    q, partial = quotes_mod.fetch_quotes(rows)
-    return {"quotes": q, "partial": partial}
+    out, partial = {}, False
+    for open_, mkt, mrows in (
+            (cn_open, "cn", [r for r in rows
+                             if not str(r["market"]).startswith("us_")]),
+            (us_open, "us", [r for r in rows
+                             if str(r["market"]).startswith("us_")])):
+        if not mrows:
+            continue
+        if not open_:
+            snap = quotes_mod.market_snapshot(mkt)
+            codes = {str(r["code"]) for r in mrows}
+            hit = {k: v for k, v in snap.items() if k in codes}
+            if hit:
+                out.update(hit)
+                continue
+        q, p = quotes_mod.fetch_quotes(mrows)
+        out.update(q)
+        partial = partial or p
+    return {"quotes": out, "partial": partial}
 
 
 def _own_instrument(conn, instrument_id, user_id):
