@@ -510,10 +510,17 @@ def dashboard(user=Depends(current_user), conn=Depends(get_conn)):
         groups.setdefault(d["market"], []).append(d)
 
     # merge live quotes server-side so the FIRST paint carries real-time
-    # price/change — no "--" flash waiting for the frontend poll
+    # price/change — no "--" flash waiting for the frontend poll.
+    # 闭市的价格已冻结：跳过实时行情合并（闭市请求不打数据源）
     try:
         all_rows = [item for items in groups.values() for item in items]
-        q, _partial = quotes_mod.fetch_quotes(all_rows)
+        cn_open = baseline_gen.cn_market_open()
+        us_open = baseline_gen.us_market_open()
+        live_rows = [d for d in all_rows
+                     if (us_open if str(d.get("market", "")).startswith("us_")
+                         else cn_open)]
+        q, _partial = (quotes_mod.fetch_quotes(live_rows) if live_rows
+                       else ({}, False))
     except Exception:
         q = {}
     for items in groups.values():
@@ -589,6 +596,13 @@ def get_quotes(user=Depends(current_user), conn=Depends(get_conn)):
         "WHERE user_id = ? AND enabled = 1", (user["id"],)).fetchall()
     if not rows:
         return {"quotes": {}, "partial": False}
+    # 闭市市场跳过：价格冻结，返回空让前端保留现值
+    cn_open = baseline_gen.cn_market_open()
+    us_open = baseline_gen.us_market_open()
+    rows = [r for r in rows
+            if (us_open if str(r["market"]).startswith("us_") else cn_open)]
+    if not rows:
+        return {"quotes": {}, "closed": True, "partial": False}
     q, partial = quotes_mod.fetch_quotes(rows)
     return {"quotes": q, "partial": partial}
 

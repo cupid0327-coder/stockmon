@@ -166,6 +166,135 @@ def weekly_macd_state(week_closes):
     return "dead_cross" if dif[-1] < dea[-1] else "alive"
 
 
+# --- 市场时段 + SQLite blob 持久化（暖重启 / 闭市免刷新）---------------------
+_CLOSED_INTRADAY_TTL = 900       # 闭市分时曲线冻结：15 分钟足够
+_INTRADAY_STALE_CLOSED = 4 * 86400   # 闭市旧曲线可跨周末供应
+_CLOSED_KLINE_TTL = 1800         # 闭市日线不变：30 分钟 TTL
+_KLINE_FAIL_FALLBACK_AGE = 7 * 86400  # 源全挂时回退库内 7 日内日K
+_BLOB_MAX_AGE = 7 * 86400
+
+_ZONES = {}
+
+
+def _zone(tzname, fallback_min):
+    if tzname not in _ZONES:
+        try:
+            from zoneinfo import ZoneInfo
+            _ZONES[tzname] = ZoneInfo(tzname)
+        except Exception:
+            _ZONES[tzname] = timezone(timedelta(minutes=fallback_min))
+    return _ZONES[tzname]
+
+
+def cn_market_open(now=None):
+    """A股交易时段（周一至五 09:25-11:35 / 12:55-15:10，含缓冲；不含节假日表）。
+    now 可传 aware datetime（任意时区）做测试。"""
+    tz = _zone("Asia/Shanghai", 480)
+    now = now.astimezone(tz) if now else datetime.now(tz)
+    if now.weekday() >= 5:
+        return False
+    m = now.hour * 60 + now.minute
+    return (565 <= m <= 695) or (775 <= m <= 910)
+
+
+def us_market_open(now=None):
+    """美股常规时段（周一至五 ET 09:25-16:05，含缓冲；不含节假日表）。"""
+    tz = _zone("America/New_York", -300)
+    now = now.astimezone(tz) if now else datetime.now(tz)
+    if now.weekday() >= 5:
+        return False
+    m = now.hour * 60 + now.minute
+    return 565 <= m <= 965
+
+
+def _market_of(secid):
+    if secid.startswith("YAHOO:"):
+        return "us"
+    return "us" if secid.split(".", 1)[0] in ("105", "106", "107") else "cn"
+
+
+def _market_open_for(secid):
+    return us_market_open() if _market_of(secid) == "us" else cn_market_open()
+
+
+def _session_date_for(secid):
+    """最近交易日（简化：周末回退周五；不含节假日）。用于分时快照的新鲜度判定。"""
+    tz = (_zone("America/New_York", -300) if _market_of(secid) == "us"
+          else _zone("Asia/Shanghai", 480))
+    d = datetime.now(tz).date()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+_PERSIST_CONN = None
+_PERSIST_LOCK = threading.Lock()
+_LAST_PERSIST = {}
+
+
+def _persist_db():
+    global _PERSIST_CONN
+    if _PERSIST_CONN is None:
+        import sqlite3
+        config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(config.DB_PATH), timeout=30,
+                               check_same_thread=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS cache_blob ("
+                     "key TEXT PRIMARY KEY, val TEXT NOT NULL, "
+                     "updated_ts REAL NOT NULL)")
+        conn.commit()
+        _PERSIST_CONN = conn
+    return _PERSIST_CONN
+
+
+def _blob_save(key, val, min_interval=0.0):
+    now = time.monotonic()
+    if min_interval and now - _LAST_PERSIST.get(key, 0.0) < min_interval:
+        return
+    try:
+        with _PERSIST_LOCK:
+            db = _persist_db()
+            db.execute(
+                "INSERT INTO cache_blob (key, val, updated_ts) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET val=excluded.val, "
+                "updated_ts=excluded.updated_ts",
+                (key, json.dumps(val, ensure_ascii=False), time.time()))
+            db.commit()
+        _LAST_PERSIST[key] = now
+    except Exception:
+        pass
+
+
+def _blob_load(key, max_age=None):
+    """返回 (val, wall_age_sec)；无记录/超龄/解析失败返回 None。"""
+    try:
+        with _PERSIST_LOCK:
+            row = _persist_db().execute(
+                "SELECT val, updated_ts FROM cache_blob WHERE key = ?",
+                (key,)).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    age = time.time() - row[1]
+    if max_age is not None and age > max_age:
+        return None
+    try:
+        return json.loads(row[0]), age
+    except Exception:
+        return None
+
+
+def _seed_from_blob(cache, key, blob_key):
+    """重启暖启动：把库内最近值按真实年龄放回内存缓存（随后的 SWR 逻辑接管刷新）。"""
+    got = _blob_load(blob_key, max_age=_BLOB_MAX_AGE)
+    if not got:
+        return False
+    val, age = got
+    cache[key] = (time.monotonic() - age, val)
+    return True
+
+
 def tencent_daily(symbol, bars=320):
     """腾讯日K备用源（东财被拒时）：[{date, open, close, high, low, volume}]。
     覆盖：A股/指数（sh/sz 前缀）、美股 NASDAQ（usXXX.OQ）、SMH（usSMH.OQ）。
@@ -488,7 +617,8 @@ def _refresh_async(cache, key, fn, args=(), keep_stale=False):
                      name="swr:" + str(key)).start()
 
 
-def _cache_lookup(cache, key, ttl, stale_limit, refresh, args, keep_stale):
+def _cache_lookup(cache, key, ttl, stale_limit, refresh, args, keep_stale,
+                  allow_refresh=True):
     """返回 (value, hit)。hit=False = 冷缓存（调用方同步计算）。
     新鲜 → 直接用；过期但有旧值（< stale_limit）→ 返回旧值并触发后台刷新；
     值为 None 的失败记录在负缓存期内视为命中（快速失败）。"""
@@ -502,7 +632,8 @@ def _cache_lookup(cache, key, ttl, stale_limit, refresh, args, keep_stale):
     if age < ttl:
         return val, True
     if age < stale_limit:
-        _refresh_async(cache, key, refresh, args, keep_stale)
+        if allow_refresh:
+            _refresh_async(cache, key, refresh, args, keep_stale)
         return val, True
     return None, False
 
@@ -560,12 +691,23 @@ def _intraday_compute(secid, sina_code=None, proxy_secid=None):
 
 def intraday_series(secid, sina_code=None, proxy_secid=None):
     """当日分时（SOX 走 SMH 代理 + 实时比值重标定）。
-    30s 新鲜；过期先回旧值并后台刷新（旧值最多供应 10 分钟）；
-    全源失败负缓存 60s —— 请求快速失败，不在请求路径重演超时链。"""
+    开市：30s 新鲜；过期先回旧值并后台刷新（旧值最多供应 10 分钟）。
+    闭市：曲线已冻结 → 15 分钟 TTL、旧值跨周末有效、不做后台刷新。
+    重启暖启动：先用 SQLite 最近快照立即返回；源全挂时回退库内当日快照；
+    失败负缓存 60s —— 快速失败，不在请求路径重演超时链。"""
     args = (secid, sina_code, proxy_secid)
-    val, hit = _cache_lookup(_INTRADAY_CACHE, secid, _INTRADAY_TTL,
-                             _INTRADAY_STALE, _intraday_compute, args,
-                             keep_stale=False)
+    open_ = _market_open_for(secid)
+    ttl = _INTRADAY_TTL if open_ else _CLOSED_INTRADAY_TTL
+    stale = _INTRADAY_STALE if open_ else _INTRADAY_STALE_CLOSED
+
+    def _lookup():
+        return _cache_lookup(_INTRADAY_CACHE, secid, ttl, stale,
+                             _intraday_compute, args, keep_stale=False,
+                             allow_refresh=open_)
+
+    val, hit = _lookup()
+    if not hit and _seed_from_blob(_INTRADAY_CACHE, secid, "intra:" + secid):
+        val, hit = _lookup()
     if hit:
         if val is None:
             raise BaselineError("分时数据暂不可用（后台重试中）")
@@ -573,9 +715,14 @@ def intraday_series(secid, sina_code=None, proxy_secid=None):
     try:
         data = _intraday_compute(*args)
     except Exception:
+        got = _blob_load("intra:" + secid)
+        if got and str((got[0] or {}).get("date") or "")[:10] == _session_date_for(secid):
+            _INTRADAY_CACHE[secid] = (time.monotonic(), got[0])
+            return got[0]
         _INTRADAY_CACHE[secid] = (time.monotonic(), None)
         raise
     _INTRADAY_CACHE[secid] = (time.monotonic(), data)
+    _blob_save("intra:" + secid, data, min_interval=60)
     return data
 
 
@@ -711,12 +858,22 @@ def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
                  xueqiu_symbol=None, stooq_symbol=None, bars=140):
     """Recent daily closes for the detail chart. SOX goes Yahoo-first, then
     the SMH proxy rescaled into index scale (same calibre as the baseline).
-    5 min fresh; stale-while-revalidate up to 24h (last known chart keeps
-    serving during source outages); total failures negative-cached 60s."""
+    开市 5 分钟新鲜 + SWR 后台刷新（旧值可供应 24h）；闭市 30 分钟 TTL 且
+    不做后台刷新（日线闭市不变）。重启暖启动取库内最近值；源全挂时回退
+    库内 7 日内快照；失败负缓存 60s。"""
     args = (secid, sina_code, proxy_secid, tencent_symbol, xueqiu_symbol,
             stooq_symbol, bars)
-    val, hit = _cache_lookup(_KLINE_CACHE, secid, _KLINE_TTL, _KLINE_STALE,
-                             _kline_compute, args, keep_stale=True)
+    open_ = _market_open_for(secid)
+    ttl = _KLINE_TTL if open_ else _CLOSED_KLINE_TTL
+
+    def _lookup():
+        return _cache_lookup(_KLINE_CACHE, secid, ttl, _KLINE_STALE,
+                             _kline_compute, args, keep_stale=True,
+                             allow_refresh=open_)
+
+    val, hit = _lookup()
+    if not hit and _seed_from_blob(_KLINE_CACHE, secid, "kline:" + secid):
+        val, hit = _lookup()
     if hit:
         if val is None:
             raise BaselineError("日K数据暂不可用（后台重试中）")
@@ -724,9 +881,14 @@ def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
     try:
         out = _kline_compute(*args)
     except Exception:
+        got = _blob_load("kline:" + secid, max_age=_KLINE_FAIL_FALLBACK_AGE)
+        if got:
+            _KLINE_CACHE[secid] = (time.monotonic(), got[0])
+            return got[0]
         _KLINE_CACHE[secid] = (time.monotonic(), None)
         raise
     _KLINE_CACHE[secid] = (time.monotonic(), out)
+    _blob_save("kline:" + secid, out, min_interval=60)
     return out
 
 
