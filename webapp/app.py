@@ -486,7 +486,7 @@ def backdrop(user=Depends(current_user), conn=Depends(get_conn)):
 
 
 @app.get("/api/dashboard")
-def dashboard(user=Depends(current_user), conn=Depends(get_conn)):
+def dashboard(fast: int = 0, user=Depends(current_user), conn=Depends(get_conn)):
     rows = conn.execute(
         "SELECT i.id, i.market, i.code, i.name, i.ma250, i.enabled, "
         "i.secid, i.sina_code, "
@@ -499,10 +499,14 @@ def dashboard(user=Depends(current_user), conn=Depends(get_conn)):
         "WHERE i.user_id = ? ORDER BY i.market, i.code",
         (user["id"],)).fetchall()
     # 并行计算各标的的实时短线状态（缓存冷时不再串行排队等网络超时）
+    # fast=1：纯库数据首屏（前端先用它秒出骨架，随后再拉完整版）
     items = [dict(r) for r in rows]
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(8, max(1, len(items)))) as ex:
-        lives = list(ex.map(_live_short_term, items))
+    if fast:
+        lives = [{} for _ in items]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, max(1, len(items)))) as ex:
+            lives = list(ex.map(_live_short_term, items))
     groups = {}
     for d, live in zip(items, lives):
         d["st_macd"] = live.get("st_macd") or d["st_macd"] or ""
@@ -512,17 +516,20 @@ def dashboard(user=Depends(current_user), conn=Depends(get_conn)):
     # merge live quotes server-side so the FIRST paint carries real-time
     # price/change — no "--" flash waiting for the frontend poll.
     # 闭市的价格已冻结：跳过实时行情合并（闭市请求不打数据源）
-    try:
-        all_rows = [item for items in groups.values() for item in items]
-        cn_open = baseline_gen.cn_market_open()
-        us_open = baseline_gen.us_market_open()
-        live_rows = [d for d in all_rows
-                     if (us_open if str(d.get("market", "")).startswith("us_")
-                         else cn_open)]
-        q, _partial = (quotes_mod.fetch_quotes(live_rows) if live_rows
-                       else ({}, False))
-    except Exception:
-        q = {}
+    # fast=1 同样跳过：首屏必须是纯库读，保证亚百毫秒
+    q = {}
+    if not fast:
+        try:
+            all_rows = [item for items in groups.values() for item in items]
+            cn_open = baseline_gen.cn_market_open()
+            us_open = baseline_gen.us_market_open()
+            live_rows = [d for d in all_rows
+                         if (us_open if str(d.get("market", "")).startswith("us_")
+                             else cn_open)]
+            q, _partial = (quotes_mod.fetch_quotes(live_rows) if live_rows
+                           else ({}, False))
+        except Exception:
+            q = {}
     for items in groups.values():
         for d in items:
             live = q.get(d["code"])

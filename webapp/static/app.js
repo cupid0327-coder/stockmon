@@ -412,11 +412,35 @@ const EVENT_SEV = t => {
 
 /* ---------------- dashboard ---------------- */
 let dashCache = null;
+let dashLoadSeq = 0;
 async function loadDashboard() {
-  const [data] = await Promise.all([api("/api/dashboard"), loadBackdrop()]);
-  dashCache = data;
-  backdropMode = (backdropSeries && backdropSeries.length) ? "dash" : "ambient";
-  renderDashboard(data);
+  /* 三击式首屏：快照先出、完整数据后台替换、迷你分时最后补画 */
+  const seq = ++dashLoadSeq;
+  /* 第一击：纯库快照（fast=1，亚百毫秒）——名字/价格/状态徽章立即渲染 */
+  try {
+    const fast = await api("/api/dashboard?fast=1");
+    if (seq === dashLoadSeq) {
+      dashCache = fast;
+      backdropMode = (backdropSeries && backdropSeries.length) ? "dash" : "ambient";
+      renderDashboard(fast);
+    }
+  } catch (_) { /* 快照失败则直接等完整版 */ }
+  /* 第二击：完整数据（实时短线状态 + 开市行情合并）后台到达后替换 */
+  try {
+    const data = await api("/api/dashboard");
+    if (seq !== dashLoadSeq) return;
+    dashCache = data;
+    backdropMode = (backdropSeries && backdropSeries.length) ? "dash" : "ambient";
+    renderDashboard(data);
+    applyQuotes();
+  } catch (_) { /* 保留首屏快照 */ }
+  /* 第三击：backdrop/迷你分时到达后只重画小图，不重建 DOM */
+  try {
+    await loadBackdrop();
+    if (seq !== dashLoadSeq) return;
+    backdropMode = (backdropSeries && backdropSeries.length) ? "dash" : "ambient";
+    renderSparks();
+  } catch (_) { /* 保持 ambient 背景 */ }
 }
 function renderDashboard(data) {
   const groups = data.groups || {};
