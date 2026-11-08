@@ -200,7 +200,51 @@ def tencent_symbol_for(market, code, secid, sina_code):
     return None
 
 
-def compute_baseline(secid=None, yahoo_symbol=None, tencent_symbol=None):
+_XQ_OPENER = None
+
+
+def _xueqiu_opener():
+    """雪球 cookie 引导（访问首页拿 token），进程内复用。"""
+    global _XQ_OPENER
+    if _XQ_OPENER is None:
+        import http.cookiejar as _cj
+        jar = _cj.CookieJar()
+        _XQ_OPENER = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar))
+        _XQ_OPENER.open(urllib.request.Request(
+            "https://xueqiu.com/about", headers={"User-Agent": UA}), timeout=10)
+    return _XQ_OPENER
+
+
+def xueqiu_daily(symbol, bars=320):
+    """雪球日K备用源（美股指数/个股，含 NYSE）：[{date, close, volume}]。"""
+    import time as _time
+    from datetime import timezone as _tz, timedelta as _td2
+    sym = urllib.parse.quote(symbol)
+    begin = int(_time.time() * 1000)
+    url = ("https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol=" + sym
+           + "&begin=" + str(begin) + "&period=day&type=before&count=-" + str(bars))
+    raw = _xueqiu_opener().open(urllib.request.Request(
+        url, headers={"User-Agent": UA}), timeout=12).read().decode("utf-8", "replace")
+    d = json.loads(raw)
+    items = (d.get("data") or {}).get("item") or []
+    out = []
+    bjtz = _tz(_td2(hours=8))
+    for it in items:
+        try:
+            ts, close, vol = it[0], float(it[2]), float(it[1] or 0)
+            out.append({"date": datetime.fromtimestamp(ts / 1000, bjtz).strftime("%Y-%m-%d"),
+                        "close": close, "volume": vol})
+        except (ValueError, TypeError, IndexError):
+            continue
+    out.sort(key=lambda b: b["date"])
+    if len(out) < 30:
+        raise BaselineError(f"雪球 {symbol} 数据不足（{len(out)}根）")
+    return out
+
+
+def compute_baseline(secid=None, yahoo_symbol=None, tencent_symbol=None,
+                     xueqiu_symbol=None):
     """MA250 + weekly MACD from daily bars. Returns dict for the DB row."""
     klines = None
     attempts = []
@@ -209,6 +253,8 @@ def compute_baseline(secid=None, yahoo_symbol=None, tencent_symbol=None):
     attempts.append(("em", secid))
     if tencent_symbol:
         attempts.append(("tencent", tencent_symbol))
+    if xueqiu_symbol:
+        attempts.append(("xueqiu", xueqiu_symbol))
     for kind, arg in attempts:
         try:
             if kind == "yahoo":
@@ -336,29 +382,57 @@ def resolve(market, code):
 def build_instrument(market, code):
     """Resolve + compute baseline（按市场构建有序数据源链，任一成功即用）：
     - A股/指数:  东财 → 腾讯（sina 代码同名）
-    - 美股个股:  东财 → 腾讯(仅NASDAQ) → 雅虎
-    - SOX:       雅虎 ^SOX → 东财 SMH → 腾讯 SMH（SMH 标度 → 重标定）
+    - 美股个股:  东财 → 腾讯(仅NASDAQ) → 雪球 → 雅虎
+    - 美股指数:  东财 → 雪球(.DJI/.IXIC) → 雅虎
+    - SOX:       雅虎 ^SOX → 东财 SMH → 腾讯 SMH → 雪球 .SOX（SMH 标度 → 重标定）
     """
     ident = resolve(market, code)
+    base, used, chain = None, None, []
+
     if ident["secid"].startswith("YAHOO:"):
-        # SOX：雅虎 → 东财 SMH → 腾讯 SMH，任一成功即用
-        base = None
+        sox = True
+        chain = [("yahoo", ident["secid"].split(":", 1)[1]),
+                 ("em", ident.get("baseline_proxy_secid") or "105.SMH"),
+                 ("tencent", "usSMH.OQ"),
+                 ("xueqiu", ".SOX")]
+    elif market == "us_index":
+        sox = False
+        chain = [("em", ident["secid"])]
+        xq = {"DJI": ".DJI", "IXIC": ".IXIC"}.get(ident["code"].upper())
+        if xq:
+            chain.append(("xueqiu", xq))
+        ym = {"DJI": "^DJI", "DJIA": "^DJI", "IXIC": "^IXIC",
+              "SPX": "^GSPC"}.get(ident["code"].upper())
+        if ym:
+            chain.append(("yahoo", ym))
+    else:
+        sox = False
+        chain = [("em", ident["secid"])]
+        tsym = tencent_symbol_for(market, ident["code"], ident["secid"], ident["sina_code"])
+        if tsym:
+            chain.append(("tencent", tsym))
+        chain.append(("xueqiu", ident["code"]))
+        chain.append(("yahoo", ident["code"]))
+
+    base, used = None, None
+    for kind, arg in chain:
         try:
-            base = compute_baseline(yahoo_symbol=ident["secid"].split(":", 1)[1])
+            if kind == "yahoo":
+                base = compute_baseline(yahoo_symbol=arg)
+            elif kind == "tencent":
+                base = compute_baseline(tencent_symbol=arg)
+            elif kind == "xueqiu":
+                base = compute_baseline(xueqiu_symbol=arg)
+            else:
+                base = compute_baseline(secid=arg)
+            used = kind
+            break
         except Exception:
-            pass
-        if base is None:
-            try:
-                base = compute_baseline(secid=ident["baseline_proxy_secid"])
-            except Exception:
-                base = None
-        if base is None:
-            try:
-                base = compute_baseline(tencent_symbol="usSMH.OQ")
-            except Exception:
-                base = None
-        if base is None:
-            raise BaselineError("费半日K不可用（雅虎/东财SMH/腾讯SMH均失败）")
+            continue
+    if base is None:
+        raise BaselineError("日K数据不可用（全部数据源均失败：东财/腾讯/雪球/雅虎）")
+
+    if sox and used != "yahoo":
         # SMH 标度 → SOX 指数标度（按新浪实时比值重标定；周线MACD标度不变）
         live = _sina_gb_price(ident["sina_code"])
         factor = live / base["last_price"]
@@ -366,25 +440,8 @@ def build_instrument(market, code):
         base["last_price"] = live
         base["ma250_source"] = "SMH_proxy_rescaled"
         base["side"] = "above" if live >= base["ma250"] else "below"
-    else:
-        base = compute_baseline(secid=ident["secid"],
-                                tencent_symbol=_tencent_symbol_for_fallback(market, ident))
-        if ident["secid"].startswith(("105.", "106.", "107.")) or market == "us_stock":
-            pass
     ident.update(base)
     return ident
-
-
-def _tencent_symbol_for_fallback(market, ident):
-    """腾讯日K代码（基线计算用）；None = 腾讯不覆盖。"""
-    if market == "us_stock":
-        mkt = ident["secid"].split(".")[0]
-        return {"105": "us" + ident["code"] + ".OQ",
-                "106": "us" + ident["code"] + ".N",
-                "107": "us" + ident["code"] + ".N"}.get(mkt)
-    if market in ("cn_stock", "cn_index"):
-        return ident["sina_code"]
-    return None
 
 
 # --- chart series (detail view) ---------------------------------------------
@@ -445,7 +502,7 @@ def intraday_series(secid, sina_code=None, proxy_secid=None):
 
 
 def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
-                 bars=140):
+                 xueqiu_symbol=None, bars=140):
     """Recent daily closes for the detail chart. SOX goes Yahoo-first, then
     the SMH proxy rescaled into index scale (same calibre as the baseline).
     Cached 5 min — the chart is daily data."""
@@ -455,27 +512,59 @@ def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
     if hit and now - hit[0] < _KLINE_TTL:
         return hit[1]
     if secid.startswith("YAHOO:"):
+        kl, source = None, None
         try:
             kl = yahoo_klines(secid.split(":", 1)[1])
             source = "yahoo"
         except Exception:
-            if not proxy_secid:
-                raise
-            kl = em_klines(proxy_secid)
-            live = _sina_gb_price(sina_code)
-            factor = live / kl[-1]["close"]
-            kl = [dict(b, close=round(b["close"] * factor, 2)) for b in kl]
-            source = proxy_secid.split(".", 1)[-1] + "_proxy_rescaled"
+            kl = None
+        if kl is None and proxy_secid:
+            try:
+                kl = em_klines(proxy_secid)
+                live = _sina_gb_price(sina_code)
+                factor = live / kl[-1]["close"]
+                kl = [dict(b, close=round(b["close"] * factor, 2)) for b in kl]
+                source = proxy_secid.split(".", 1)[-1] + "_proxy_rescaled"
+            except Exception:
+                kl = None
+        if kl is None:
+            try:
+                kl = tencent_daily("usSMH.OQ")
+                live = _sina_gb_price(sina_code)
+                factor = live / kl[-1]["close"]
+                kl = [dict(b, close=round(b["close"] * factor, 2)) for b in kl]
+                source = "SMH_tencent_rescaled"
+            except Exception:
+                kl = None
+        if kl is None and xueqiu_symbol:
+            try:
+                kl = xueqiu_daily(xueqiu_symbol)
+                source = "xueqiu_sox"
+            except Exception:
+                kl = None
+        if kl is None:
+            raise BaselineError("SOX 日K不可用（雅虎/东财SMH/腾讯SMH/雪球均失败）")
     else:
-        kl = None
+        kl, source = None, None
         try:
             kl = em_klines(secid)
             source = "eastmoney"
         except Exception:
-            if not tencent_symbol:
-                raise
-            kl = tencent_daily(tencent_symbol)
-            source = "tencent"
+            kl = None
+        if kl is None and tencent_symbol:
+            try:
+                kl = tencent_daily(tencent_symbol)
+                source = "tencent"
+            except Exception:
+                kl = None
+        if kl is None and xueqiu_symbol:
+            try:
+                kl = xueqiu_daily(xueqiu_symbol)
+                source = "xueqiu"
+            except Exception:
+                kl = None
+        if kl is None:
+            raise BaselineError("日K数据不可用（东财/腾讯/雪球均失败）")
     out = {"bars": [{"date": b["date"], "close": b["close"],
                      "volume": b.get("volume") or 0}
                     for b in kl[-bars:]],
