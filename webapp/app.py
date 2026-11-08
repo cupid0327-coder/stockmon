@@ -2,6 +2,7 @@
 static SPA hosting, and the scheduler thread lifecycle.
 Run:  uvicorn webapp.app:app --host 127.0.0.1 --port 8100   (single worker!)
 """
+import concurrent.futures
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -443,8 +444,7 @@ def backdrop(user=Depends(current_user), conn=Depends(get_conn)):
         "SELECT market, code, name, sina_code, secid FROM instruments "
         "WHERE user_id = ? AND enabled = 1 ORDER BY id",
         (user["id"],)).fetchall()
-    out = []
-    for r in rows:
+    def _row_entry(r):
         try:
             secid, sina, proxy = baseline_gen.chart_request_for(
                 r["code"], r["secid"], r["sina_code"])
@@ -458,7 +458,7 @@ def backdrop(user=Depends(current_user), conn=Depends(get_conn)):
                                              stooq_symbol=ssym)
             closes = [b["close"] for b in data["bars"]][-90:]
             if len(closes) < 20:
-                continue
+                return None
             lo, hi = min(closes), max(closes)
             span = (hi - lo) or 1.0
             entry = {"code": r["code"], "name": r["name"],
@@ -474,10 +474,15 @@ def backdrop(user=Depends(current_user), conn=Depends(get_conn)):
                                          "preClose": intr["preClose"]}
             except Exception:
                 pass
-            out.append(entry)
+            return entry
         except Exception:
-            continue
-    return {"series": out}
+            return None
+
+    # 并行拉各标的的日K/分时（多级数据源超时不再串行叠加）
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, max(1, len(rows)))) as ex:
+        entries = list(ex.map(_row_entry, rows))
+    return {"series": [e for e in entries if e]}
 
 
 @app.get("/api/dashboard")
@@ -493,10 +498,13 @@ def dashboard(user=Depends(current_user), conn=Depends(get_conn)):
         "LEFT JOIN instrument_status s ON s.instrument_id = i.id "
         "WHERE i.user_id = ? ORDER BY i.market, i.code",
         (user["id"],)).fetchall()
+    # 并行计算各标的的实时短线状态（缓存冷时不再串行排队等网络超时）
+    items = [dict(r) for r in rows]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, max(1, len(items)))) as ex:
+        lives = list(ex.map(_live_short_term, items))
     groups = {}
-    for r in rows:
-        d = dict(r)
-        live = _live_short_term(d)
+    for d, live in zip(items, lives):
         d["st_macd"] = live.get("st_macd") or d["st_macd"] or ""
         d["st_rsi"] = live.get("st_rsi") or d["st_rsi"] or ""
         groups.setdefault(d["market"], []).append(d)

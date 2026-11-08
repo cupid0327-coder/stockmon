@@ -5,6 +5,8 @@ everything, Yahoo chart API for ^SOX. Pure stdlib HTTP.
 """
 import json
 import re
+import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -456,6 +458,53 @@ _KLINE_TTL = 300
 
 _INTRADAY_CACHE = {}  # secid -> (monotonic_ts, data)
 _INTRADAY_TTL = 30
+_INTRADAY_STALE = 600   # 过期旧值最多继续供应 10 分钟（分时实时性敏感）
+_KLINE_STALE = 86400    # 日K旧值可供应一整天（跨数据源中断保图）
+
+_NEG_TTL = 60           # 全源失败的负缓存：快速失败，不在请求路径重演超时链
+_REFRESHING = set()
+_REFRESH_LOCK = threading.Lock()
+
+
+def _refresh_async(cache, key, fn, args=(), keep_stale=False):
+    """后台单线程刷新一个缓存键（_REFRESHING 防并发重入）。"""
+    with _REFRESH_LOCK:
+        if key in _REFRESHING:
+            return
+        _REFRESHING.add(key)
+
+    def _worker():
+        try:
+            cache[key] = (time.monotonic(), fn(*args))
+        except Exception:
+            old = cache.get(key)
+            keep = old[1] if (keep_stale and old and old[1] is not None) else None
+            cache[key] = (time.monotonic(), keep)
+        finally:
+            with _REFRESH_LOCK:
+                _REFRESHING.discard(key)
+
+    threading.Thread(target=_worker, daemon=True,
+                     name="swr:" + str(key)).start()
+
+
+def _cache_lookup(cache, key, ttl, stale_limit, refresh, args, keep_stale):
+    """返回 (value, hit)。hit=False = 冷缓存（调用方同步计算）。
+    新鲜 → 直接用；过期但有旧值（< stale_limit）→ 返回旧值并触发后台刷新；
+    值为 None 的失败记录在负缓存期内视为命中（快速失败）。"""
+    hit = cache.get(key)
+    if not hit:
+        return None, False
+    ts, val = hit
+    age = time.monotonic() - ts
+    if val is None:
+        return None, age < _NEG_TTL
+    if age < ttl:
+        return val, True
+    if age < stale_limit:
+        _refresh_async(cache, key, refresh, args, keep_stale)
+        return val, True
+    return None, False
 
 
 def _trends2(secid):
@@ -480,13 +529,7 @@ def _trends2(secid):
     return {"points": pts, "preClose": pre, "date": day}
 
 
-def intraday_series(secid, sina_code=None, proxy_secid=None):
-    """当日分时（SOX 走 SMH 代理 + 实时比值重标定）。30s 缓存。"""
-    import time
-    now_m = time.monotonic()
-    hit = _INTRADAY_CACHE.get(secid)
-    if hit and now_m - hit[0] < _INTRADAY_TTL:
-        return hit[1]
+def _intraday_compute(secid, sina_code=None, proxy_secid=None):
     if secid.startswith("YAHOO:"):
         if not proxy_secid:
             raise BaselineError("该标的无分时数据源")
@@ -512,7 +555,27 @@ def intraday_series(secid, sina_code=None, proxy_secid=None):
                 data = None
         if data is None:
             raise BaselineError("分时数据不可用（东财/腾讯均失败）")
-    _INTRADAY_CACHE[secid] = (now_m, data)
+    return data
+
+
+def intraday_series(secid, sina_code=None, proxy_secid=None):
+    """当日分时（SOX 走 SMH 代理 + 实时比值重标定）。
+    30s 新鲜；过期先回旧值并后台刷新（旧值最多供应 10 分钟）；
+    全源失败负缓存 60s —— 请求快速失败，不在请求路径重演超时链。"""
+    args = (secid, sina_code, proxy_secid)
+    val, hit = _cache_lookup(_INTRADAY_CACHE, secid, _INTRADAY_TTL,
+                             _INTRADAY_STALE, _intraday_compute, args,
+                             keep_stale=False)
+    if hit:
+        if val is None:
+            raise BaselineError("分时数据暂不可用（后台重试中）")
+        return val
+    try:
+        data = _intraday_compute(*args)
+    except Exception:
+        _INTRADAY_CACHE[secid] = (time.monotonic(), None)
+        raise
+    _INTRADAY_CACHE[secid] = (time.monotonic(), data)
     return data
 
 
@@ -570,16 +633,8 @@ def stooq_daily(symbol, bars=320):
     return out
 
 
-def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
-                 xueqiu_symbol=None, stooq_symbol=None, bars=140):
-    """Recent daily closes for the detail chart. SOX goes Yahoo-first, then
-    the SMH proxy rescaled into index scale (same calibre as the baseline).
-    Cached 5 min — the chart is daily data."""
-    import time
-    now = time.monotonic()
-    hit = _KLINE_CACHE.get(secid)
-    if hit and now - hit[0] < _KLINE_TTL:
-        return hit[1]
+def _kline_compute(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
+                   xueqiu_symbol=None, stooq_symbol=None, bars=140):
     if secid.startswith("YAHOO:"):
         kl, source = None, None
         try:
@@ -646,11 +701,32 @@ def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
                 kl = None
         if kl is None:
             raise BaselineError("日K数据不可用（东财/腾讯/雪球/stooq均失败）")
-    out = {"bars": [{"date": b["date"], "close": b["close"],
-                     "volume": b.get("volume") or 0}
-                    for b in kl[-bars:]],
-           "source": source}
-    _KLINE_CACHE[secid] = (now, out)
+    return {"bars": [{"date": b["date"], "close": b["close"],
+                      "volume": b.get("volume") or 0}
+                     for b in kl[-bars:]],
+            "source": source}
+
+
+def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
+                 xueqiu_symbol=None, stooq_symbol=None, bars=140):
+    """Recent daily closes for the detail chart. SOX goes Yahoo-first, then
+    the SMH proxy rescaled into index scale (same calibre as the baseline).
+    5 min fresh; stale-while-revalidate up to 24h (last known chart keeps
+    serving during source outages); total failures negative-cached 60s."""
+    args = (secid, sina_code, proxy_secid, tencent_symbol, xueqiu_symbol,
+            stooq_symbol, bars)
+    val, hit = _cache_lookup(_KLINE_CACHE, secid, _KLINE_TTL, _KLINE_STALE,
+                             _kline_compute, args, keep_stale=True)
+    if hit:
+        if val is None:
+            raise BaselineError("日K数据暂不可用（后台重试中）")
+        return val
+    try:
+        out = _kline_compute(*args)
+    except Exception:
+        _KLINE_CACHE[secid] = (time.monotonic(), None)
+        raise
+    _KLINE_CACHE[secid] = (time.monotonic(), out)
     return out
 
 
