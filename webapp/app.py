@@ -4,6 +4,7 @@ Run:  uvicorn webapp.app:app --host 127.0.0.1 --port 8100   (single worker!)
 """
 import concurrent.futures
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -596,6 +597,11 @@ def index_catalog(_=Depends(current_user)):
     }
 
 
+# 开市行情的进程内共享缓存（30s）：前端 15s 轮询 × N 用户 → 至多每 30s 一次实时拉取
+_QUOTES_MEM = {}          # "cn"|"us" -> (monotonic_ts, {code: q}, partial)
+_QUOTES_MEM_TTL = 30.0
+
+
 @app.get("/api/quotes")
 def get_quotes(user=Depends(current_user), conn=Depends(get_conn)):
     rows = conn.execute(
@@ -603,7 +609,8 @@ def get_quotes(user=Depends(current_user), conn=Depends(get_conn)):
         "WHERE user_id = ? AND enabled = 1", (user["id"],)).fetchall()
     if not rows:
         return {"quotes": {}, "partial": False}
-    # 开市实时拉；闭市回放库内快照（基本面/收盘价冻结，不再打数据源）。
+    # 开市：30s 进程内共享缓存（多用户/多标签页轮询合并为至多每 30s 一次
+    # 实时拉取）；闭市：回放库内快照（基本面/收盘价冻结，零数据源请求）。
     # 冷库（尚无快照）时闭市也拉一次兜底并顺势落库。
     cn_open = baseline_gen.cn_market_open()
     us_open = baseline_gen.us_market_open()
@@ -615,14 +622,23 @@ def get_quotes(user=Depends(current_user), conn=Depends(get_conn)):
                              if str(r["market"]).startswith("us_")])):
         if not mrows:
             continue
-        if not open_:
-            snap = quotes_mod.market_snapshot(mkt)
-            codes = {str(r["code"]) for r in mrows}
-            hit = {k: v for k, v in snap.items() if k in codes}
-            if hit:
-                out.update(hit)
+        codes = {str(r["code"]) for r in mrows}
+        if open_:
+            hit = _QUOTES_MEM.get(mkt)
+            if hit and time.monotonic() - hit[0] < _QUOTES_MEM_TTL:
+                out.update({k: v for k, v in hit[1].items() if k in codes})
+                partial = partial or hit[2]
                 continue
+        else:
+            snap = quotes_mod.market_snapshot(mkt)
+            if snap:
+                hit = {k: v for k, v in snap.items() if k in codes}
+                if hit:
+                    out.update(hit)
+                    continue
         q, p = quotes_mod.fetch_quotes(mrows)
+        if open_:
+            _QUOTES_MEM[mkt] = (time.monotonic(), q, p)
         out.update(q)
         partial = partial or p
     return {"quotes": out, "partial": partial}
