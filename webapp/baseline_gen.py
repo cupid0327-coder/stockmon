@@ -60,21 +60,30 @@ def em_klines(secid, days=430):
            "&klt=101&fqt=1&beg=" + beg.strftime("%Y%m%d") + "&end=" +
            end.strftime("%Y%m%d") +
            "&fields1=f1,f2,f3,f4,f5&fields2=f51,f52,f53,f54,f55,f56,f57")
-    raw = _fetch(url, {"User-Agent": UA}).decode("utf-8", "replace")
-    klines = (json.loads(raw).get("data") or {}).get("klines") or []
-    out = []
-    for k in klines:
-        f = k.split(",")
-        if len(f) < 7:
-            continue
+    headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
+    import time as _time
+    last_err = None
+    for _attempt in range(2):
         try:
-            out.append({"date": f[0], "open": float(f[1]), "close": float(f[2]),
-                        "high": float(f[3]), "low": float(f[4]),
-                        "volume": float(f[5] or 0)})
-        except ValueError:
-            continue
-    out.sort(key=lambda b: b["date"])
-    return out
+            raw = _fetch(url, headers).decode("utf-8", "replace")
+            klines = (json.loads(raw).get("data") or {}).get("klines") or []
+            out = []
+            for k in klines:
+                f = k.split(",")
+                if len(f) < 7:
+                    continue
+                try:
+                    out.append({"date": f[0], "open": float(f[1]), "close": float(f[2]),
+                                "high": float(f[3]), "low": float(f[4]),
+                                "volume": float(f[5] or 0)})
+                except ValueError:
+                    continue
+            out.sort(key=lambda b: b["date"])
+            return out
+        except Exception as e:
+            last_err = e
+            _time.sleep(1)
+    raise last_err if last_err else RuntimeError("em_klines failed")
 
 
 def yahoo_klines(symbol, months=18):
@@ -137,9 +146,64 @@ def weekly_macd_state(week_closes):
     return "dead_cross" if dif[-1] < dea[-1] else "alive"
 
 
-def compute_baseline(secid=None, yahoo_symbol=None):
+def tencent_daily(symbol, bars=320):
+    """腾讯日K备用源（东财被拒时）：[{date, open, close, high, low, volume}]。
+    覆盖：A股/指数（sh/sz 前缀）、美股 NASDAQ（usXXX.OQ）、SMH（usSMH.OQ）。
+    注意：NYSE 与美股大盘指数在腾讯只有单根，不可用作基线。"""
+    url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param="
+           + urllib.parse.quote(symbol) + ",day,,," + str(bars) + ",qfq")
+    raw = _fetch(url, {"User-Agent": UA}).decode("utf-8", "replace")
+    d = json.loads(raw).get("data") or {}
+    node = d.get(symbol) or {}
+    day = node.get("day") or node.get("qfqday") or []
+    out = []
+    for row in day:
+        if len(row) < 6:
+            continue
+        try:
+            out.append({"date": row[0], "open": float(row[1]), "close": float(row[2]),
+                        "high": float(row[3]), "low": float(row[4]),
+                        "volume": float(row[5] or 0)})
+        except ValueError:
+            continue
+    out.sort(key=lambda b: b["date"])
+    return out
+
+
+def tencent_symbol_for(market, code, secid, sina_code):
+    """该标的在腾讯源的日K代码；None = 腾讯不覆盖（NYSE/美股大盘指数等）。"""
+    if market in ("cn_stock", "cn_index"):
+        return sina_code
+    if market == "us_stock":
+        mkt = (secid or "").split(".")[0]
+        sfx = {"105": ".OQ", "106": ".N", "107": ".N"}.get(mkt)
+        # 腾讯对 NYSE/AMEX 只有单根历史，不可用
+        return ("us" + code + sfx) if mkt == "105" else None
+    return None
+
+
+def compute_baseline(secid=None, yahoo_symbol=None, tencent_symbol=None):
     """MA250 + weekly MACD from daily bars. Returns dict for the DB row."""
-    klines = (yahoo_klines(yahoo_symbol) if yahoo_symbol else em_klines(secid))
+    klines = None
+    attempts = []
+    if yahoo_symbol:
+        attempts.append(("yahoo", yahoo_symbol))
+    attempts.append(("em", secid))
+    if tencent_symbol:
+        attempts.append(("tencent", tencent_symbol))
+    for kind, arg in attempts:
+        try:
+            if kind == "yahoo":
+                klines = yahoo_klines(arg)
+            elif kind == "tencent":
+                klines = tencent_daily(arg)
+            else:
+                klines = em_klines(arg)
+            break
+        except Exception:
+            klines = None
+    if not klines:
+        raise BaselineError("日K数据不可用（东财/雅虎/腾讯均失败）")
     closes = [b["close"] for b in klines]
     if len(closes) < 250:
         raise BaselineError(f"日K历史不足（{len(closes)}根<250），无法计算年线")
@@ -252,29 +316,57 @@ def resolve(market, code):
 
 
 def build_instrument(market, code):
-    """Resolve + compute baseline in one step (used by POST /api/instruments)."""
+    """Resolve + compute baseline（按市场构建有序数据源链，任一成功即用）：
+    - A股/指数:  东财 → 腾讯（sina 代码同名）
+    - 美股个股:  东财 → 腾讯(仅NASDAQ) → 雅虎
+    - SOX:       雅虎 ^SOX → 东财 SMH → 腾讯 SMH（SMH 标度 → 重标定）
+    """
     ident = resolve(market, code)
     if ident["secid"].startswith("YAHOO:"):
+        # SOX：雅虎 → 东财 SMH → 腾讯 SMH，任一成功即用
+        base = None
         try:
             base = compute_baseline(yahoo_symbol=ident["secid"].split(":", 1)[1])
         except Exception:
-            proxy = ident.get("baseline_proxy_secid")
-            if not proxy:
-                raise
-            base = compute_baseline(secid=proxy)  # SMH daily K, SMH scale
-            # Rescale MA250 from the proxy's price scale into the index's own
-            # scale via the live ratio (weekly MACD is scale-invariant). The
-            # implicit constant-ratio assumption is the proxy's known error.
-            live = _sina_gb_price(ident["sina_code"])
-            factor = live / base["last_price"]
-            base["ma250"] = round(base["ma250"] * factor, 4)
-            base["last_price"] = live
-            base["ma250_source"] = (proxy.split(".", 1)[-1] + "_proxy_rescaled")
-            base["side"] = "above" if live >= base["ma250"] else "below"
+            pass
+        if base is None:
+            try:
+                base = compute_baseline(secid=ident["baseline_proxy_secid"])
+            except Exception:
+                base = None
+        if base is None:
+            try:
+                base = compute_baseline(tencent_symbol="usSMH.OQ")
+            except Exception:
+                base = None
+        if base is None:
+            raise BaselineError("费半日K不可用（雅虎/东财SMH/腾讯SMH均失败）")
+        # SMH 标度 → SOX 指数标度（按新浪实时比值重标定；周线MACD标度不变）
+        live = _sina_gb_price(ident["sina_code"])
+        factor = live / base["last_price"]
+        base["ma250"] = round(base["ma250"] * factor, 4)
+        base["last_price"] = live
+        base["ma250_source"] = "SMH_proxy_rescaled"
+        base["side"] = "above" if live >= base["ma250"] else "below"
     else:
-        base = compute_baseline(secid=ident["secid"])
+        base = compute_baseline(secid=ident["secid"],
+                                tencent_symbol=_tencent_symbol_for_fallback(market, ident))
+        if ident["secid"].startswith(("105.", "106.", "107.")) or market == "us_stock":
+            pass
     ident.update(base)
     return ident
+
+
+def _tencent_symbol_for_fallback(market, ident):
+    """腾讯日K代码（基线计算用）；None = 腾讯不覆盖。"""
+    if market == "us_stock":
+        mkt = ident["secid"].split(".")[0]
+        return {"105": "us" + ident["code"] + ".OQ",
+                "106": "us" + ident["code"] + ".N",
+                "107": "us" + ident["code"] + ".N"}.get(mkt)
+    if market in ("cn_stock", "cn_index"):
+        return ident["sina_code"]
+    return None
 
 
 # --- chart series (detail view) ---------------------------------------------
@@ -334,7 +426,8 @@ def intraday_series(secid, sina_code=None, proxy_secid=None):
     return data
 
 
-def daily_closes(secid, sina_code=None, proxy_secid=None, bars=140):
+def daily_closes(secid, sina_code=None, proxy_secid=None, tencent_symbol=None,
+                 bars=140):
     """Recent daily closes for the detail chart. SOX goes Yahoo-first, then
     the SMH proxy rescaled into index scale (same calibre as the baseline).
     Cached 5 min — the chart is daily data."""
@@ -356,8 +449,15 @@ def daily_closes(secid, sina_code=None, proxy_secid=None, bars=140):
             kl = [dict(b, close=round(b["close"] * factor, 2)) for b in kl]
             source = proxy_secid.split(".", 1)[-1] + "_proxy_rescaled"
     else:
-        kl = em_klines(secid)
-        source = "eastmoney"
+        kl = None
+        try:
+            kl = em_klines(secid)
+            source = "eastmoney"
+        except Exception:
+            if not tencent_symbol:
+                raise
+            kl = tencent_daily(tencent_symbol)
+            source = "tencent"
     out = {"bars": [{"date": b["date"], "close": b["close"],
                      "volume": b.get("volume") or 0}
                     for b in kl[-bars:]],

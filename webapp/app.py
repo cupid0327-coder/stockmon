@@ -440,7 +440,7 @@ def backdrop(user=Depends(current_user), conn=Depends(get_conn)):
     dashboard backdrop field and row sparklines (both read the same
     5-min-cached daily closes)."""
     rows = conn.execute(
-        "SELECT code, name, sina_code, secid FROM instruments "
+        "SELECT market, code, name, sina_code, secid FROM instruments "
         "WHERE user_id = ? AND enabled = 1 ORDER BY id",
         (user["id"],)).fetchall()
     out = []
@@ -448,8 +448,10 @@ def backdrop(user=Depends(current_user), conn=Depends(get_conn)):
         try:
             secid, sina, proxy = baseline_gen.chart_request_for(
                 r["code"], r["secid"], r["sina_code"])
+            tsym = baseline_gen.tencent_symbol_for(r["market"], r["code"],
+                                                   r["secid"], r["sina_code"])
             data = baseline_gen.daily_closes(secid, sina_code=sina,
-                                             proxy_secid=proxy)
+                                             proxy_secid=proxy, tencent_symbol=tsym)
             closes = [b["close"] for b in data["bars"]][-90:]
             if len(closes) < 20:
                 continue
@@ -610,9 +612,11 @@ def instrument_kline(instrument_id: int, user=Depends(current_user),
     row = _own_instrument(conn, instrument_id, user["id"])
     secid, sina, proxy = baseline_gen.chart_request_for(
         row["code"], row["secid"], row["sina_code"])
+    tsym = baseline_gen.tencent_symbol_for(row["market"], row["code"],
+                                           row["secid"], row["sina_code"])
     try:
         data = baseline_gen.daily_closes(secid, sina_code=sina,
-                                         proxy_secid=proxy)
+                                         proxy_secid=proxy, tencent_symbol=tsym)
     except Exception as e:
         raise HTTPException(502, f"日K数据源请求失败：{e}")
     # short-term indicators off the same closes (detector's own functions —
