@@ -659,7 +659,8 @@ def chart_request_for(code, secid, sina_code):
     if secid.startswith("YAHOO:"):
         entry = US_INDEX_MAP.get((code or "").upper())
         return secid, sina_code, (entry[4] if entry else None)
-    return secid, None, None
+    # 非 YAHOO 也必须透出 sina_code：分时接口靠它走腾讯备用源
+    return secid, sina_code, None
 
 
 # --- DB -> baseline files (for the detector) --------------------------------
