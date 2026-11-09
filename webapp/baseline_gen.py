@@ -4,6 +4,7 @@ Same data calibre as the detector: EastMoney daily K (forward-adjusted) for
 everything, Yahoo chart API for ^SOX. Pure stdlib HTTP.
 """
 import json
+import logging
 import re
 import threading
 import time
@@ -13,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import config
+
+log = logging.getLogger("stockmon.baseline_gen")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
@@ -208,9 +211,13 @@ def us_market_open(now=None):
 
 
 def _market_of(secid):
+    """secid 前缀 → 市场。105/106/107 是美股个股（NASDAQ/NYSE/AMEX），
+    100 是美股指数（100.DJIA/IXIC/SPX，见 US_INDEX_MAP）；A 股 secid 只以
+    单个 "0." / "1." 开头，无歧义。"""
     if secid.startswith("YAHOO:"):
         return "us"
-    return "us" if secid.split(".", 1)[0] in ("105", "106", "107") else "cn"
+    return ("us" if secid.split(".", 1)[0] in ("100", "105", "106", "107")
+            else "cn")
 
 
 def _market_open_for(secid):
@@ -261,8 +268,9 @@ def _blob_save(key, val, min_interval=0.0):
                 (key, json.dumps(val, ensure_ascii=False), time.time()))
             db.commit()
         _LAST_PERSIST[key] = now
-    except Exception:
-        pass
+    except Exception as e:
+        # 落库失败只影响暖启动，不能让请求路径挂掉——但必须留痕（磁盘满/库被锁）
+        log.warning("blob save failed for %s: %s", key, e)
 
 
 def _blob_load(key, max_age=None):

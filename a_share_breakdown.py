@@ -911,10 +911,16 @@ def main():
             code = row["code"]
             sig, note = None, None
             try:
-                kl = fetch_daily_klines(by_code[code]["secid"], now)
-                sig, note = eval_take_profit(row, kl)
+                kl = fetch_daily_klines_cached(by_code[code]["secid"], now)
             except Exception:
-                sig, note = None, None
+                kl = []
+            if not kl:
+                # 数据源抖动时 fetch 返回 []（不抛异常）：此时既不能改徽章
+                # 也不能把去重状态清成 inactive，否则下一轮成功收盘会重复
+                # 发同一信号。跳过本标的，_apply_rows 的 COALESCE 会保留
+                # 上一次的 sell_signal/sell_note。
+                continue
+            sig, note = eval_take_profit(row, kl)
             row["sell_signal"] = sig or "none"
             row["sell_note"] = note
             cur = tp.setdefault(code, {"active": False, "signal": "none",
@@ -954,10 +960,13 @@ def main():
                 continue
             sig, note = None, None
             try:
-                kl = fetch_daily_klines(by_code[code]["secid"], now)
-                sig, note = eval_add_position(row, kl)
+                kl = fetch_daily_klines_cached(by_code[code]["secid"], now)
             except Exception:
-                sig, note = None, None
+                kl = []
+            if not kl:
+                # 同止赢：空 K 线既不改徽章也不清去重状态，避免重复告警
+                continue
+            sig, note = eval_add_position(row, kl)
             row["buy_signal"] = sig or "none"
             row["buy_note"] = note
             cur = ap.setdefault(code, {"active": False, "signal": "none"})

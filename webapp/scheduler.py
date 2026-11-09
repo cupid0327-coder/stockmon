@@ -55,7 +55,6 @@ class Scheduler:
         return now.weekday() == 5 and 6 <= now.hour < 12
 
     def _weekly_refresh(self, conn, now):
-        from . import db as dbm
         today = now.strftime("%Y-%m-%d")
         if self._last_weekly == today:
             return
@@ -70,11 +69,13 @@ class Scheduler:
                     "weekly_macd=? WHERE id=?",
                     (b["ma250"], b["ma250_asof"], b["last_price"],
                      b["weekly_macd"], r["id"]))
+                # 逐标的提交：每个都含网络请求，整批跑完再提交的话中途
+                # 出错/重启会让已完成的部分全部回滚
+                conn.commit()
                 ok += 1
             except Exception as e:  # keep going; next week retries
                 log.warning("weekly refresh %s failed: %s", r["code"], e)
                 fail += 1
-        conn.commit()
         self._last_weekly = today
         conn.execute(
             "INSERT INTO runs (ts, window, decision, reason) VALUES (?,?,?,?)",
@@ -87,13 +88,40 @@ class Scheduler:
         """Run one cycle. force bypasses the window gate (for /api/run-once).
         Returns a small dict describing what happened."""
         now = datetime.now(TZ)
+        today = now.strftime("%Y-%m-%d")
+        # 每周基线重算必须先于窗口门判断：周六 06:00-12:00 北京落在所有
+        # 交易窗口之外（window_of 返回 None），原先放在 _tick_locked 里的
+        # 判断永远到不了。命中时只跑基线重算，不跑检测器。
+        if not force and self._weekly_refresh_due(now) and self._last_weekly != today:
+            with self._run_lock:
+                return self._tick_weekly(now)
         win = _load_detector().window_of(now)
         if win is None and not force:
             return {"status": "skipped", "reason": "outside trading windows",
                     "at": now.isoformat(timespec="seconds")}
 
         with self._run_lock:
-            return self._tick_locked(now, win, force)
+            result = self._tick_locked(now, win, force)
+        # 邮件摘要放到锁外发送：SMTP 握手可能耗时数十秒，不能占着检测锁
+        # 与库连接（emitted 含所有用户的明细，也不再回传给调用方）
+        emitted = result.pop("emitted", None)
+        if emitted:
+            self._send_mail_digests(emitted)
+        return result
+
+    def _tick_weekly(self, now):
+        """Saturday-morning baseline refresh only (no detector run)."""
+        from . import db as dbm
+        conn = dbm.connect()
+        try:
+            self._weekly_refresh(conn, now)
+        except Exception as e:
+            log.warning("weekly refresh crashed: %s", e)
+            return {"status": "error", "reason": f"weekly refresh failed: {e}"}
+        finally:
+            conn.close()
+        return {"status": "ok", "reason": "weekly baseline refresh",
+                "at": now.isoformat(timespec="seconds")}
 
     def _tick_locked(self, now, win, force):
         from . import db as dbm
@@ -266,20 +294,31 @@ class Scheduler:
                     conn.execute("UPDATE instruments SET last_price=? WHERE id=?",
                                  (r["price"], inst["id"]))
 
-    def _send_mail_digests(self, conn, emitted):
-        """按用户邮箱合并发送本轮事件摘要；失败仅记日志。"""
+    def _send_mail_digests(self, emitted):
+        """按用户邮箱合并发送本轮事件摘要；失败仅记日志。
+
+        调用点在 _run_lock 之外，自建短连接读邮箱后立即关闭，再发信
+        （避免 SMTP 期间占着库连接）。"""
         if not emitted:
             return
+        from . import db as dbm
         try:
             by_user = {}
             for e in emitted:
                 by_user.setdefault(e["user_id"], []).append(e)
+            emails = {}
+            conn = dbm.connect()
+            try:
+                for uid in by_user:
+                    row = conn.execute("SELECT email FROM users WHERE id = ?",
+                                       (uid,)).fetchone()
+                    emails[uid] = ((row["email"] or "").strip()
+                                   if row and row["email"] else None)
+            finally:
+                conn.close()
             for uid, evs in by_user.items():
-                row = conn.execute("SELECT email FROM users WHERE id = ?",
-                                   (uid,)).fetchone()
-                email = (row["email"] or "").strip() if row and row["email"] else None
-                if email:
-                    mailer.send_event_digest(email, evs)
+                if emails.get(uid):
+                    mailer.send_event_digest(emails[uid], evs)
         except Exception as e:
             log.warning("mail digest failed: %s", e)
 
@@ -290,11 +329,17 @@ class Scheduler:
             return {}
 
     @staticmethod
-    def _state_lookup(state, market, code, row_side):
-        """Pull (side, day1, below_days) from the detector's state file."""
+    def _state_entry(state, market, code):
+        """Detector state entry for one instrument, or None when the state
+        file has no record for it (disabled / not covered by the last run)."""
         group = ("us_items" if market.startswith("us_")
                  else "indices" if market == "cn_index" else "stocks")
-        entry = (state.get(group) or {}).get(str(code)) or {}
+        return (state.get(group) or {}).get(str(code))
+
+    @classmethod
+    def _state_lookup(cls, state, market, code, row_side):
+        """Pull (side, day1, below_days) from the detector's state file."""
+        entry = cls._state_entry(state, market, code) or {}
         side = entry.get("side") or row_side or "above"
         return side, bool(entry.get("day1")), int(entry.get("below_days") or 0)
 
@@ -306,8 +351,14 @@ class Scheduler:
             "SELECT s.instrument_id, i.market, i.code FROM instrument_status s "
             "JOIN instruments i ON i.id = s.instrument_id").fetchall()
         for r in rows:
-            side, day1, below_days = self._state_lookup(
-                state, r["market"], r["code"], None)
+            entry = self._state_entry(state, r["market"], r["code"])
+            if not entry:
+                # 状态文件里没有该标的（本轮未覆盖/已停用/被裁剪）：
+                # 不能默认成 above，否则每次收盘都会把最后已知的破位状态抹掉
+                continue
+            side = entry.get("side") or "above"
+            day1 = bool(entry.get("day1"))
+            below_days = int(entry.get("below_days") or 0)
             status = status_label(side, day1, below_days)
             conn.execute(
                 "UPDATE instrument_status SET side=?, status=?, below_days=?, "

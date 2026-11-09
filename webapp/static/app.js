@@ -49,6 +49,22 @@ function toast(msg, isErr) {
   el._t = setTimeout(() => { el.hidden = true; }, 2600);
 }
 
+/* FastAPI 校验失败时 detail 是 [{loc,msg,...}]：直接塞进 Error 会显示
+   [object Object]，这里统一抽成一句人话 */
+function detailMsg(data, status) {
+  const d = data && data.detail;
+  if (typeof d === "string" && d) return d;
+  if (Array.isArray(d) && d.length) {
+    const first = d[0] || {};
+    if (first.msg) {
+      const loc = (first.loc || []).filter(x => x !== "body").join(".");
+      return loc ? `${loc}: ${first.msg}` : String(first.msg);
+    }
+    if (first.detail) return String(first.detail);
+  }
+  return `HTTP ${status}`;
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -59,8 +75,10 @@ async function api(path, opts = {}) {
   let data = {};
   try { data = await res.json(); } catch (_) { /* empty */ }
   if (!res.ok) {
-    const err = new Error(data.detail || `HTTP ${res.status}`);
+    const err = new Error(detailMsg(data, res.status));
     err.status = res.status;
+    /* 会话过期/被吊销：回到登录页，而不是让每个面板静默失败 */
+    if (res.status === 401 && me) showAuth();
     throw err;
   }
   return data;
@@ -209,6 +227,8 @@ function applyAlertMode(dash) {
 function magnetic(sel) {
   if (!FINE || REDUCED) return;
   $$(sel).forEach(el => {
+    if (el.dataset.magnetized) return;   /* 每次渲染都会调用：不标记会无界累积监听器 */
+    el.dataset.magnetized = "1";
     el.addEventListener("pointermove", e => {
       const r = el.getBoundingClientRect();
       const dx = e.clientX - (r.left + r.width / 2);
@@ -218,12 +238,17 @@ function magnetic(sel) {
     el.addEventListener("pointerleave", () => { el.style.transform = ""; });
   });
 }
+/* 数字滚动：与 fmtPrice 同口径保留千分位（≥1000 的价格不能变成 3500.12） */
+function fmtNum(v, digits) {
+  return Number(v).toLocaleString("en-US",
+    { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
 function countUp(el, to, digits, suffix) {
   const from = parseFloat(el.dataset.v || "0") || 0;
   const target = parseFloat(to);
   el.dataset.v = isNaN(target) ? "" : target;
   if (REDUCED || isNaN(target) || from === target) {
-    el.textContent = isNaN(target) ? "--" : target.toFixed(digits) + (suffix || "");
+    el.textContent = isNaN(target) ? "--" : fmtNum(target, digits) + (suffix || "");
     return;
   }
   const t0 = performance.now(), dur = 760;
@@ -231,9 +256,9 @@ function countUp(el, to, digits, suffix) {
   function frame(t) {
     const p = Math.min(1, (t - t0) / dur);
     const e = 1 + c3 * Math.pow(p - 1, 3) + c1 * Math.pow(p - 1, 2);
-    el.textContent = (from + (target - from) * e).toFixed(digits) + (suffix || "");
+    el.textContent = fmtNum(from + (target - from) * e, digits) + (suffix || "");
     if (p < 1) requestAnimationFrame(frame);
-    else el.textContent = target.toFixed(digits) + (suffix || "");
+    else el.textContent = fmtNum(target, digits) + (suffix || "");
   }
   requestAnimationFrame(frame);
 }
@@ -258,8 +283,26 @@ function showAuth() {
   $("#view-app").hidden = true;
   $("#auth-error").hidden = true;
   positionTabInk();
+  /* 跨用户状态必须全部复位：否则换账号登录会看到上一位的迷你分时、
+     行情与图表缓存（me 也在这里清，供 401 拦截直接调用） */
+  me = null;
   detailSeries = null;
+  detailItem = null;
+  detailStatus = null;
+  lastDetailPrice = null;
+  backdropSeries = null;
+  backdropAt = 0;
   backdropMode = "ambient";
+  alertMode = false;
+  document.body.classList.remove("alert-mode");
+  liveQuotes = {};
+  dashCache = null;
+  chartState = null;
+  intradayState = null;
+  priceMemo = {};
+  seenIids = null;
+  dashSel = null;
+  syncRunOnce();
 }
 function showApp() {
   $("#view-auth").hidden = true;
@@ -448,18 +491,23 @@ const EVENT_SEV = t => {
 /* ---------------- dashboard ---------------- */
 let dashCache = null;
 let dashLoadSeq = 0;
+let priceMemo = {};   /* iid -> 上一轮显示价：重建 DOM 后不从 0 数起 */
+let seenIids = null;  /* 已出现过的 iid：只有新标的才播放入场动画 */
 async function loadDashboard() {
   /* 三击式首屏：快照先出、完整数据后台替换、迷你分时最后补画 */
   const seq = ++dashLoadSeq;
-  /* 第一击：纯库快照（fast=1，亚百毫秒）——名字/价格/状态徽章立即渲染 */
-  try {
-    const fast = await api("/api/dashboard?fast=1");
-    if (seq === dashLoadSeq) {
-      dashCache = fast;
-      backdropMode = (backdropSeries && backdropSeries.length) ? "dash" : "ambient";
-      renderDashboard(fast);
-    }
-  } catch (_) { /* 快照失败则直接等完整版 */ }
+  /* 第一击：纯库快照（fast=1，亚百毫秒）——只在首屏打一次；后续刷新
+     已有完整数据，再打一次反而会把价格闪回旧值 */
+  if (!dashCache) {
+    try {
+      const fast = await api("/api/dashboard?fast=1");
+      if (seq === dashLoadSeq) {
+        dashCache = fast;
+        backdropMode = (backdropSeries && backdropSeries.length) ? "dash" : "ambient";
+        renderDashboard(fast);
+      }
+    } catch (_) { /* 快照失败则直接等完整版 */ }
+  }
   /* 第二击：完整数据（实时短线状态 + 开市行情合并）后台到达后替换 */
   try {
     const data = await api("/api/dashboard");
@@ -505,6 +553,7 @@ function renderDashboard(data) {
 
   /* groups */
   const wrap = $("#dash-groups");
+  const seen = seenIids || (seenIids = new Set());
   const sections = [
     { key: "cn_stock", items: groups.cn_stock || [] },
     { key: "cn_index", items: groups.cn_index || [] },
@@ -521,13 +570,14 @@ function renderDashboard(data) {
         <h2 class="sec-title">${m.title}</h2>
         <span class="sec-desc">${sec.items.filter(i => i.enabled).length}/${sec.items.length} 启用</span>
       </div>
-      ${sec.items.map(itemHTML).join("")}
+      ${sec.items.map(i => itemHTML(i, !seen.has(i.id))).join("")}
     </div>`;
   }).join("") || `
     <div class="empty-state">
       <span class="ic">${iconSvg("radar")}</span><br>
       暂无自选标的<button data-goto="watchlist">前往添加</button>
     </div>`;
+  all.forEach(i => seen.add(i.id));
   hydrateIcons(wrap);
   $$("[data-goto]", wrap).forEach(b => b.addEventListener("click",
     () => nav("watchlist")));
@@ -550,7 +600,7 @@ function renderDashboard(data) {
   animatePrices();
   magnetic(".btn-magnetic");
 }
-function itemHTML(i) {
+function itemHTML(i, isNew) {
   /* 临时判定与正式 side 字段同口径：收盘确认前按现价 vs MA250 推断 */
   const below = i.side === "below" ||
     (i.status == null && i.price != null && i.ma250 && i.price < i.ma250);
@@ -568,7 +618,7 @@ function itemHTML(i) {
         : i.st_note ? `<span class="sell-note">${esc(i.st_note)}</span>` : ""}
     </div>` : "";
   return `
-  <article class="item enter" data-iid="${i.id}" data-code="${esc(i.code)}">
+  <article class="item${isNew ? " enter" : ""}" data-iid="${i.id}" data-code="${esc(i.code)}" data-sina="${esc(i.sina_code || "")}">
     <div class="item-id">
       <span class="item-name">${esc(i.name)}</span>
       <span class="item-code">${esc(i.code)}</span>
@@ -576,7 +626,7 @@ function itemHTML(i) {
     </div>
     <div class="item-st">${stBadge(i)}</div>
     <div class="item-price">
-      <b class="num" data-price="${i.price ?? ""}"><span class="item-live" hidden></span>${fmtPrice(i.price)}</b>
+      <b class="num" data-price="${i.price ?? ""}" data-v="${priceMemo[i.id] ?? ""}"><span class="item-live" hidden></span>${fmtPrice(i.price)}</b>
       <span class="item-chg ${chgClass(i.day_change_pct)}">${fmtSigned(i.day_change_pct)}</span>
     </div>
     <div class="item-ma">
@@ -600,7 +650,10 @@ function distOf(i) {
 function animatePrices() {
   $$("#dash-groups [data-price]").forEach(el => {
     const v = parseFloat(el.dataset.price);
-    if (!isNaN(v)) countUp(el, v, 2);
+    if (isNaN(v)) return;
+    countUp(el, v, 2);
+    const item = el.closest(".item");
+    if (item && item.dataset.iid) priceMemo[item.dataset.iid] = v;
   });
 }
 
@@ -644,7 +697,8 @@ function renderSparks() {
       const ax = sessionAxis(s.market);
       const slots = s.intraday.pts.map(pt => slotOf(pt[0], ax.sess));
       arr = s.intraday.pts.map(pt => pt[1]);
-      base = s.intraday.preClose;
+      /* 昨收缺失时退回首点：否则带宽退化成 {-1,1}，曲线会画到画布外 */
+      base = s.intraday.preClose != null ? s.intraday.preClose : arr[0];
       xs = (slots[slots.length - 1] - slots[0] < 1)
         ? arr.map((_, i) => i / Math.max(1, arr.length - 1))
         : slots.map(v => v / ax.total);
@@ -698,9 +752,10 @@ function renderTimeline(el, evs, markFirst) {
     el.innerHTML = `<li class="tl-empty">暂无事件 —— 检测器会在跌破年线、止赢信号触发等时刻在这里记录</li>`;
     return;
   }
-  const prevFirst = markFirst ? el.dataset.first : null;
+  /* 只有比上一轮首条更新的条目才播放入场：否则每次刷新整列重放 */
+  const prevFirst = markFirst ? Number(el.dataset.first || 0) : 0;
   el.innerHTML = evs.map(e => `
-    <li class="tl-item ${EVENT_SEV(e.event_type)}${e.id + "" === prevFirst ? "" : (markFirst ? " enter" : "")}">
+    <li class="tl-item ${EVENT_SEV(e.event_type)}${Number(e.id) > prevFirst ? " enter" : ""}">
       <span class="tl-dot"></span>
       <div class="tl-top">
         <span class="tl-time">${fmtTime(e.ts)}</span>
@@ -778,9 +833,11 @@ async function loadWatchlist() {
 }
 
 function initAddForm() {
-  $$(".seg-btn").forEach(b => b.addEventListener("click", () => {
+  /* 必须限定在 #market-seg 内：看板筛选按钮也是 .seg-btn，之前会被一起
+     绑定，点一次筛选就把 addMarket 置成 undefined 并抢走高亮 */
+  $$("#market-seg .seg-btn").forEach(b => b.addEventListener("click", () => {
     addMarket = b.dataset.market;
-    $$(".seg-btn").forEach(x => x.classList.toggle("is-active", x === b));
+    $$("#market-seg .seg-btn").forEach(x => x.classList.toggle("is-active", x === b));
     renderChips();
   }));
   $("#add-form").addEventListener("submit", async e => {
@@ -843,14 +900,30 @@ async function renderChips() {
 
 /* ---------------- live quotes (Sina batch, 15s in-session) ---------------- */
 let liveQuotes = {};
-function marketPulse() {
-  const d = new Date();
-  const bj = new Date(d.getTime() + (480 + d.getTimezoneOffset()) * 60000);
-  const day = bj.getDay(), mins = bj.getHours() * 60 + bj.getMinutes();
-  if (day === 0 || day === 6) return false;
-  const cn = (mins >= 570 && mins < 690) || (mins >= 780 && mins < 900);
-  const us = mins >= 1290 || mins < 240; /* 粗判，容忍冬夏令时 */
-  return cn || us;
+/* == marketmath == */
+/* 以下时段/带宽纯函数由 tests/frontend 抽取求值测试：不要依赖 DOM 与全局状态 */
+/* 某个时区的本地时钟：CN 用北京、US 用纽约（夏令时自动正确） */
+function clockIn(zone, d) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: zone, weekday: "short",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(d);
+  const get = t => (parts.find(p => p.type === t) || {}).value;
+  return {
+    day: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(get("weekday")),
+    mins: (Number(get("hour")) % 24) * 60 + Number(get("minute")),
+  };
+}
+function marketPulse(d = new Date()) {
+  /* 必须按各自交易所的本地时钟判：北京周六 00:00-05:00 正是周五美股
+     尾盘（之前的 day===6 → false 会把最后 4 小时当闭市） */
+  const cn = clockIn("Asia/Shanghai", d);
+  const cnOpen = cn.day >= 1 && cn.day <= 5 &&
+    ((cn.mins >= 570 && cn.mins < 690) || (cn.mins >= 780 && cn.mins < 900));
+  const us = clockIn("America/New_York", d);
+  const usOpen = us.day >= 1 && us.day <= 5 &&
+    us.mins >= 565 && us.mins < 965;   /* 09:25-16:05 ET，与后端同口径 */
+  return cnOpen || usOpen;
 }
 
 /* ---------------- 分时固定时段轴 ----------------
@@ -904,6 +977,7 @@ function priceBand(values, preClose) {
   const half = niceStep(Math.max(dev * 1.12, preClose * .005));
   return { lo: preClose - half, hi: preClose + half };
 }
+/* == /marketmath == */
 async function pollQuotes() {
   try {
     const r = await api("/api/quotes");
@@ -912,8 +986,10 @@ async function pollQuotes() {
   } catch (_) { /* keep last values */ }
 }
 function applyQuotes() {
-  $$("#dash-groups .item[data-code]").forEach(el => {
-    const q = liveQuotes[el.dataset.code];
+  /* 行情按 sina_code 取：裸 6 位 code 不唯一（上证指数 sh000001 与
+     平安银行 sz000001 都是 "000001"） */
+  $$("#dash-groups .item[data-sina]").forEach(el => {
+    const q = liveQuotes[el.dataset.sina];
     if (!q || q.price == null) return;
     const dot = el.querySelector(".item-live");
     if (dot) dot.hidden = false;
@@ -929,7 +1005,7 @@ function applyQuotes() {
     const all = Object.values(dashCache.groups || {}).flat();
     if (all.length) {
       const seg = all.map(i => {
-        const q = liveQuotes[i.code];
+        const q = liveQuotes[i.sina_code];
         const price = q && q.price != null ? q.price : i.price;
         const chg = q && q.day_change_pct != null ? q.day_change_pct : i.day_change_pct;
         return `<span class="tk"><span class="tk-name">${esc(i.name)}</span>` +
@@ -941,15 +1017,10 @@ function applyQuotes() {
     }
   }
   if (currentNav === "detail" && detailItem) {
-    const q = liveQuotes[detailItem.code];
+    const q = liveQuotes[detailItem.sina_code];
     if (q && q.price != null) {
-      countUp($("#d-price"), q.price, 2);
-      const c = $("#d-chg");
-      c.textContent = fmtSigned(q.day_change_pct);
-      c.className = "d-chg num " + chgClass(q.day_change_pct);
-    }
-    const pel = $("#d-price");
-    if (q && q.price != null) {
+      const pel = $("#d-price");
+      /* 切标的时 lastDetailPrice 已复位：首次不动画，避免误闪涨跌色 */
       if (lastDetailPrice != null && q.price !== lastDetailPrice && !REDUCED) {
         pel.classList.remove("flash-up", "flash-down");
         void pel.offsetWidth;
@@ -964,7 +1035,10 @@ function applyQuotes() {
     renderDetailStats(q, detailItem, detailStatus, false);
   }
 }
+let quotesStarted = false;
 function startQuotes() {
+  if (quotesStarted) return;   /* boot() 每次登录都会调用：不幂等会重复轮询 */
+  quotesStarted = true;
   let lastFetch = 0;
   setInterval(() => {
     if (document.hidden || !me) return;
@@ -1035,6 +1109,10 @@ let detailItem = null;
 let detailStatus = null;
 let prevNav = "dashboard";
 async function loadDetail(id) {
+  /* 换标的才复位闪色基准与价格起点：同一标的刷新（含 60s 自动刷新）
+     应当接着上一次的价格数，而不是从 0 重播 */
+  const isNewItem = !detailItem || String(detailItem.id) !== String(id);
+  if (isNewItem) lastDetailPrice = null;
   try {
     const data = await api(`/api/instruments/${id}`);
     detailItem = data.item;
@@ -1051,7 +1129,7 @@ async function loadDetail(id) {
     const dist = price != null && data.item.ma250
       ? (price / data.item.ma250 - 1) * 100 : null;
     const pe = $("#d-price");
-    pe.dataset.v = "0";
+    if (isNewItem) pe.dataset.v = "0";
     countUp(pe, price != null ? price : NaN, 2);
     const chg = $("#d-chg");
     chg.textContent = fmtSigned(st.day_change_pct);
@@ -1099,8 +1177,9 @@ async function loadDetail(id) {
         : `<span class="badge badge-st"><span class="dot"></span>待收盘评估</span>`) +
       `</div>`;
     hydrateIcons($("#panel-detail"));
-    renderDetailStats(liveQuotes[data.item.code], data.item, st, true);
-    renderTimeline($("#d-timeline"), data.events, false);
+    renderDetailStats(liveQuotes[data.item.sina_code], data.item, st, isNewItem);
+    if (isNewItem) $("#d-timeline").dataset.first = "";   /* 换标的：时间线重新入场 */
+    renderTimeline($("#d-timeline"), data.events, true);
     loadChart(id, data.events, st.status === "effective");
     loadIntraday(id);
     pollQuotes();  // fill live price/chg immediately instead of next cycle
@@ -1109,6 +1188,7 @@ async function loadDetail(id) {
 async function loadChart(id, events, isEffective) {
   try {
     const k = await api(`/api/instruments/${id}/kline`);
+    if (!k.bars || !k.bars.length) throw new Error("无日线数据");
     const closes = k.bars.map(b => b.close);
     const ma5s = rollingMa(closes, 5);
     const ma10s = rollingMa(closes, 10);
@@ -1116,6 +1196,9 @@ async function loadChart(id, events, isEffective) {
       .filter(e => /break|release/.test(e.event_type))
       .map(e => ({ date: String(e.ts).slice(0, 10), type: e.event_type }));
     const cv = $("#d-chart");
+    /* 守卫必须在重新赋值之前：旧代码先覆盖 chartState 再查 _raf，
+       守卫恒为假 → 快速连开两个标的会有两个动画循环并行重画 */
+    if (chartState && chartState._raf) cancelAnimationFrame(chartState._raf);
     chartState = {
       cv, bars: k.bars, ma250: k.ma250, ma5s, ma10s, evDates,
       dpr: Math.min(devicePixelRatio || 1, 2),
@@ -1123,7 +1206,6 @@ async function loadChart(id, events, isEffective) {
       cross: null,
     };
     /* draw-in 生长动画：仅前台播放；后台打开直接完整呈现（兜底见 finishPendingChart） */
-    if (chartState._raf) cancelAnimationFrame(chartState._raf);
     let done = false;
     const finish = () => {
       if (done) return;
@@ -1156,6 +1238,10 @@ async function loadChart(id, events, isEffective) {
       `近 ${k.bars.length} 个交易日收盘 · 虚线 MA250 · 青线 MA5 · 紫线 MA10${src}`;
     renderStStats(k.st);
   } catch (e) {
+    /* 数据不可用/为空：必须清掉上一个标的的曲线，否则画布上留着别人的走势 */
+    if (chartState && chartState._raf) cancelAnimationFrame(chartState._raf);
+    chartState = null;
+    clearCanvas($("#d-chart"));
     $("#d-chart-cap").textContent = "走势图数据不可用：" + e.message;
   }
 }
@@ -1391,6 +1477,13 @@ function syncChartBox(S, fbW = 600, fbH = 240) {
   S.W = S.cv.clientWidth || S.W || fbW;
   S.H = S.cv.clientHeight || S.H || fbH;
 }
+/* 重设位图尺寸即清空（切到无数据/加载失败的标的时必须擦掉上一个标的的曲线） */
+function clearCanvas(cv) {
+  if (!cv) return;
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  cv.width = Math.round((cv.clientWidth || 600) * dpr);
+  cv.height = Math.round((cv.clientHeight || 240) * dpr);
+}
 /* devicePixelRatio 变化（跨屏移动 / 系统缩放 / 浏览器缩放）时重画：
    matchMedia 的 resolution 查询只在比值真的变了才触发，比值一变就按新 dpr 重新挂载 */
 function watchDpr(fn) {
@@ -1454,7 +1547,8 @@ let intradayStarted = false;
 async function loadIntraday(id) {
   try {
     const d = await api(`/api/instruments/${id}/intraday`);
-    if (d.preClose == null && d.points.length) d.preClose = d.points[0][1];
+    if (!d.points || !d.points.length) throw new Error("无分时数据");
+    if (d.preClose == null) d.preClose = d.points[0][1];
     intradayState = { cv: $("#d-intraday"), ...d, cross: null };
     renderIntraday();
     attachIntradayInteractions();
@@ -1462,16 +1556,27 @@ async function loadIntraday(id) {
       `${d.date} 分时${d.source.includes("proxy") ? " · SMH代理重标定" : ""}` +
       ` · 基准昨收 ${fmtPrice(d.preClose)}`;
   } catch (e) {
+    /* 无数据/请求失败：清空状态与画布（否则残留上一个标的的曲线，且
+       mousemove 里访问 S.slots 会每帧抛 TypeError） */
+    intradayState = null;
+    renderIntraday();
     $("#d-intraday-cap").textContent = "分时数据不可用：" + e.message;
   }
 }
 function renderIntraday() {
   const S = intradayState;
-  if (!S || !S.points.length) return;
+  if (!S || !S.points || !S.points.length) {   /* 空态：擦掉旧曲线后退出 */
+    clearCanvas($("#d-intraday"));
+    return;
+  }
   const cv = S.cv;
   syncChartBox(S, 600, 220);
   const dpr = S.dpr, W = S.W, H = S.H;
-  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  /* 只有尺寸真的变了才重设位图：mousemove/RO/dpr 每次重设会把整张图重建 */
+  const needW = Math.round(W * dpr), needH = Math.round(H * dpr);
+  if (cv.width !== needW || cv.height !== needH) {
+    cv.width = needW; cv.height = needH;
+  }
   const ctx = cv.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const n = S.points.length;
@@ -1868,6 +1973,7 @@ async function boot() {
   const h = (location.hash || "").replace("#/", "");
   const isAdmin = me && me.role === "admin";
   $$(".admin-only").forEach(el => { el.hidden = !isAdmin; });
+  syncRunOnce();   /* 「立即检测」按钮只在管理员登录时出现 */
   const valid = ["dashboard", "watchlist", "logs", "guide", ...(isAdmin ? ["admin"] : [])];
   currentNav = valid.includes(h) ? h : "dashboard";
   $$(".panel").forEach(p => p.classList.remove("is-active"));
@@ -1930,16 +2036,30 @@ function initChrome() {
   }, 60000);
 }
 async function refreshCurrent() {
-  if (currentNav === "dashboard") await Promise.all([loadDashboard(), loadEvents()]);
+  if (currentNav === "detail" && detailItem) {
+    /* 详情页刷新要刷详情自己的四块内容：之前落到 else 分支只拉日志，
+       图与分时看起来"刷新没反应" */
+    const id = detailItem.id;
+    await loadDetail(id);
+  }
+  else if (currentNav === "dashboard") await Promise.all([loadDashboard(), loadEvents()]);
   else if (currentNav === "watchlist") await loadWatchlist();
   else if (currentNav === "admin") await loadAdmin();
   else if (currentNav === "guide") { /* 静态说明页，无需刷新 */ }
   else await loadRuns();
 }
 
-/* run-once (logs view) */
-function initRunOnce() {
+/* run-once (logs view) —— 管理员专用：后端 /api/run-once 已收紧为 admin 依赖 */
+let runOnceBtn = null;
+function syncRunOnce() {
   const head = $("#panel-logs .sec-head");
+  if (!head) return;
+  const isAdmin = !!(me && me.role === "admin");
+  if (!isAdmin) {   /* 普通用户不挂按钮（接口也会 403） */
+    if (runOnceBtn) { runOnceBtn.remove(); runOnceBtn = null; }
+    return;
+  }
+  if (runOnceBtn) return;
   const btn = document.createElement("button");
   btn.className = "btn-magnetic sm";
   btn.innerHTML = `<span class="ic">${iconSvg("arrow-right")}</span><span>立即检测</span>`;
@@ -1955,6 +2075,8 @@ function initRunOnce() {
     finally { btn.disabled = false; }
   });
   head.appendChild(btn);
+  runOnceBtn = btn;
+  magnetic(".btn-magnetic");   /* 新按钮同样挂磁吸（已去重） */
 }
 
 /* ---------------- start ---------------- */
@@ -1964,7 +2086,6 @@ initAuth();
 initNav();
 initAddForm();
 initChrome();
-initRunOnce();
 initMailSettings();
 initPassword();
 renderChips();

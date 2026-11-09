@@ -54,6 +54,16 @@ python -m uvicorn webapp.app:app --host 127.0.0.1 --port 8100
 - 添加自选：A 股输代码（600000 / 002008），指数从目录点选（含上证 B 股、北证 50），美股输代码（NVDA），美股指数（DJI / IXIC / SPX / SOX）
 - 添加时自动拉取日K计算 MA250 与周线 MACD；盘中分时图自动启用
 
+## 测试
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q                        # 后端：行情键 / 状态机 / 调度 / 认证 / 接口契约
+node --test "tests/frontend/*.test.mjs"    # 前端：时段判定 / 分时轴 / 对称带宽（纯函数）
+```
+
+后端用例把 `STOCKMON_DATA_DIR` 指向临时目录，不会碰 `webapp/data`；前端用例从 `webapp/static/app.js` 的 `/* == marketmath == */` 标记区间抽取求值，保持无构建步骤。两套用例都不发真实网络请求（数据源在用例里被替换）。
+
 ## 监控范围与数据源
 
 | 类型 | 覆盖 | 数据源 |
@@ -97,6 +107,8 @@ webapp/
   static/              # 前端（index/app/style/icons + 内嵌字体）
   data/                # 运行时数据（备份这个目录）
   README.md            # 部署与 SMTP 详细指引
+tests/                 # pytest（后端）+ node --test（前端纯函数）
+requirements-dev.txt   # 开发/测试依赖
 ```
 
 ## Oracle Cloud 部署

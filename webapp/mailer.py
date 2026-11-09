@@ -39,7 +39,14 @@ def effective_settings():
             conn.close()
     except Exception as e:
         log.warning("settings read failed, falling back to env: %s", e)
-    port = int(rows.get("smtp_port") or config.SMTP_PORT or 465)
+    raw_port = str(rows.get("smtp_port") or config.SMTP_PORT or "465").strip()
+    try:
+        port = int(raw_port)
+        if not 1 <= port <= 65535:
+            raise ValueError(port)
+    except ValueError:
+        # 非法端口不能变成 ValueError 冒到接口层（会 500）；按配置错误上报
+        raise MailerError(f"SMTP 端口无效：{raw_port!r}（应为 1-65535 的数字）")
     user = rows.get("smtp_user") or config.SMTP_USER
     host = rows.get("smtp_host") or config.SMTP_HOST
     pwd = rows.get("smtp_pass") or config.SMTP_PASS

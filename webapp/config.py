@@ -23,7 +23,10 @@ INTRADAY_REFRESH_SECS = int(os.environ.get("STOCKMON_INTRADAY_REFRESH", "60"))
 
 # 邮件通知：全部走环境变量；SMTP_HOST 未配置时邮件功能静默关闭
 SMTP_HOST = os.environ.get("STOCKMON_SMTP_HOST", "")
-SMTP_PORT = int(os.environ.get("STOCKMON_SMTP_PORT", "465"))
+try:
+    SMTP_PORT = int(os.environ.get("STOCKMON_SMTP_PORT", "465"))
+except ValueError:          # 非法环境变量不应让整个应用起不来
+    SMTP_PORT = 465
 SMTP_USER = os.environ.get("STOCKMON_SMTP_USER", "")
 SMTP_PASS = os.environ.get("STOCKMON_SMTP_PASS", "")
 MAIL_FROM = os.environ.get("STOCKMON_MAIL_FROM", SMTP_USER)

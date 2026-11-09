@@ -4,6 +4,7 @@ Run:  uvicorn webapp.app:app --host 127.0.0.1 --port 8100   (single worker!)
 """
 import concurrent.futures
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -62,8 +63,11 @@ def get_conn():
 
 
 def client_ip(request: Request) -> str:
+    # nginx 用 $proxy_add_x_forwarded_for 把真实客户端追加在末尾，取最后一跳；
+    # 取第一个等于信任客户端自己填的值，限流可被随意绕过
     fwd = request.headers.get("x-forwarded-for")
-    return (fwd.split(",")[0].strip() if fwd else None) or \
+    hops = [h.strip() for h in fwd.split(",") if h.strip()] if fwd else []
+    return (hops[-1] if hops else None) or \
         (request.client.host if request.client else "?")
 
 
@@ -197,13 +201,19 @@ _MAIL_KEYS = ("smtp_host", "smtp_port", "smtp_user", "smtp_pass",
 def admin_mail_get(_=Depends(admin_user), conn=Depends(get_conn)):
     rows = {r["key"]: r["value"] for r in
             conn.execute("SELECT key, value FROM settings")}
-    cfg = mailer.effective_settings()
+    try:
+        cfg = mailer.effective_settings()
+        configured = cfg["configured"]
+    except mailer.MailerError as e:
+        # 例如库里存着历史遗留的非法端口：管理页要能打开并让人改回来
+        cfg, configured = {}, False
+        log.warning("mail settings invalid: %s", e)
     return {
         "host": rows.get("smtp_host") or "", "port": rows.get("smtp_port") or "465",
         "user": rows.get("smtp_user") or "", "mail_from": rows.get("mail_from") or "",
         "tls": rows.get("smtp_tls") or "ssl",
         "has_pass": bool(rows.get("smtp_pass")),
-        "configured": cfg["configured"],
+        "configured": configured,
         "env_fallback": bool(config.SMTP_HOST),
     }
 
@@ -220,12 +230,20 @@ class MailSettings(BaseModel):
 @app.post("/api/admin/mail")
 def admin_mail_save(body: MailSettings, _=Depends(admin_user),
                     conn=Depends(get_conn)):
+    port = body.port.strip() or "465"
+    # 存进去的非数字端口会在 mailer.effective_settings 里 int() 抛错，
+    # 让整个管理页 500——这里先拦住
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise HTTPException(400, "SMTP 端口应为 1-65535 的数字")
+    tls = body.tls.strip() or "ssl"
+    if tls not in ("ssl", "starttls"):
+        raise HTTPException(400, "加密方式应为 ssl 或 starttls")
     vals = {
         "smtp_host": body.host.strip(),
-        "smtp_port": body.port.strip() or "465",
+        "smtp_port": port,
         "smtp_user": body.user.strip(),
         "mail_from": body.mail_from.strip(),
-        "smtp_tls": body.tls.strip() or "ssl",
+        "smtp_tls": tls,
     }
     if body.passwd.strip():
         vals["smtp_pass"] = body.passwd.strip()
@@ -335,6 +353,8 @@ def admin_delete_user(user_id: int, admin=Depends(admin_user),
     if row["role"] == "admin":
         raise HTTPException(400, "不能删除管理员账号")
     conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    # events 没有外键约束，删用户不会级联，必须显式清理（否则留下孤儿事件）
+    conn.execute("DELETE FROM events WHERE user_id = ?", (user_id,))
     conn.commit()
     return {"ok": True}
 
@@ -502,13 +522,17 @@ def dashboard(fast: int = 0, user=Depends(current_user), conn=Depends(get_conn))
         (user["id"],)).fetchall()
     # 并行计算各标的的实时短线状态（缓存冷时不再串行排队等网络超时）
     # fast=1：纯库数据首屏（前端先用它秒出骨架，随后再拉完整版）
+    # 已停用的标的跳过：状态不该随行情变，没必要为它打数据源
     items = [dict(r) for r in rows]
-    if fast:
-        lives = [{} for _ in items]
-    else:
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, max(1, len(items)))) as ex:
-            lives = list(ex.map(_live_short_term, items))
+    lives = [{} for _ in items]
+    if not fast:
+        todo = [i for i, d in enumerate(items) if d["enabled"]]
+        if todo:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(8, max(1, len(todo)))) as ex:
+                for i, v in zip(todo, ex.map(lambda n: _live_short_term(items[n]),
+                                             todo)):
+                    lives[i] = v
     groups = {}
     for d, live in zip(items, lives):
         d["st_macd"] = live.get("st_macd") or d["st_macd"] or ""
@@ -517,24 +541,28 @@ def dashboard(fast: int = 0, user=Depends(current_user), conn=Depends(get_conn))
 
     # merge live quotes server-side so the FIRST paint carries real-time
     # price/change — no "--" flash waiting for the frontend poll.
-    # 闭市的价格已冻结：跳过实时行情合并（闭市请求不打数据源）
-    # fast=1 同样跳过：首屏必须是纯库读，保证亚百毫秒
+    # 与 /api/quotes 共用同一份共享缓存：多用户看板刷新不再各打一遍数据源。
+    # 闭市走库内快照回放（冻结价），fast=1 完全跳过（首屏必须是纯库读）
     q = {}
     if not fast:
         try:
             all_rows = [item for items in groups.values() for item in items]
-            cn_open = baseline_gen.cn_market_open()
-            us_open = baseline_gen.us_market_open()
-            live_rows = [d for d in all_rows
-                         if (us_open if str(d.get("market", "")).startswith("us_")
-                             else cn_open)]
-            q, _partial = (quotes_mod.fetch_quotes(live_rows) if live_rows
-                           else ({}, False))
+            for open_, mkt, mrows in (
+                    (baseline_gen.cn_market_open(), "cn",
+                     [d for d in all_rows
+                      if not str(d.get("market", "")).startswith("us_")]),
+                    (baseline_gen.us_market_open(), "us",
+                     [d for d in all_rows
+                      if str(d.get("market", "")).startswith("us_")])):
+                if not mrows:
+                    continue
+                got, _partial = _cached_quotes(mrows, mkt, open_)
+                q.update(got)
         except Exception:
             q = {}
     for items in groups.values():
         for d in items:
-            live = q.get(d["code"])
+            live = q.get(d["sina_code"])
             if live:
                 if live.get("price") is not None:
                     d["price"] = live["price"]
@@ -565,10 +593,15 @@ def runs(limit: int = 50, conn=Depends(get_conn), _=Depends(current_user)):
 
 
 @app.post("/api/run-once")
-def run_once(user=Depends(current_user)):
-    """Force one detection cycle regardless of the window gate (debug/verify)."""
+def run_once(_=Depends(admin_user)):
+    """Force one detection cycle regardless of the window gate.
+
+    管理员专用：强制跑一轮会把所有用户的标的都打一遍数据源。
+    响应只回状态，不回事件明细（emitted 含全部用户的 code/价格，
+    tick() 已在返回前把它摘掉）。"""
     result = get_scheduler().tick(force=True)
-    return result
+    return {k: result.get(k) for k in
+            ("status", "decision", "reason", "window", "events")}
 
 
 @app.get("/api/instruments/{instrument_id}/intraday")
@@ -599,9 +632,59 @@ def index_catalog(_=Depends(current_user)):
     }
 
 
-# 开市行情的进程内共享缓存（30s）：前端 15s 轮询 × N 用户 → 至多每 30s 一次实时拉取
-_QUOTES_MEM = {}          # "cn"|"us" -> (monotonic_ts, {code: q}, partial)
+# 开市行情的进程内共享缓存（30s）：前端 15s 轮询 × N 用户 → 至多每 30s 一次
+# 实时拉取。按标的（sina_code）逐键计时：缓存内容来自多个用户的并集，
+# 谁没持有的标的都不会因此缺价（旧实现按市场存整块，只含单个请求的子集）。
+_QUOTES_MEM = {}          # "cn"|"us" -> {sina_code: (monotonic_ts, q)}
 _QUOTES_MEM_TTL = 30.0
+# 单飞：冷缓存时并发请求排队，只有第一个真去拉数据源，其余等锁后吃缓存
+_QUOTES_LOCKS = {"cn": threading.Lock(), "us": threading.Lock()}
+
+
+def _cached_quotes(rows, mkt, open_):
+    """(rows, market, market_open) -> ({sina_code: quote}, partial_failed)。
+
+    开市：逐键命中 _QUOTES_MEM，缺失/过期的键合并成一次 fetch_quotes。
+    闭市：回放库内快照，但仅在**全部**键都命中时才不拉数据源（旧实现只要
+    命中一条就跳过拉取，其余标的静默缺价）。
+    """
+    if not rows:
+        return {}, False
+    out = {}
+    cache = _QUOTES_MEM.setdefault(mkt, {}) if open_ else None
+    snap = None if open_ else quotes_mod.market_snapshot(mkt)
+
+    def have(key):
+        if open_:
+            hit = cache.get(key)
+            return (hit[1] if hit
+                    and time.monotonic() - hit[0] < _QUOTES_MEM_TTL else None)
+        return snap.get(key)
+
+    for r in rows:
+        v = have(str(r["sina_code"]))
+        if v is not None:
+            out[str(r["sina_code"])] = v
+
+    missing = [r for r in rows if str(r["sina_code"]) not in out]
+    partial = False
+    if missing:
+        with _QUOTES_LOCKS[mkt]:
+            if not open_:
+                snap = quotes_mod.market_snapshot(mkt)   # 等锁期间可能已落库
+            for r in missing:
+                v = have(str(r["sina_code"]))
+                if v is not None:
+                    out[str(r["sina_code"])] = v
+            missing = [r for r in missing if str(r["sina_code"]) not in out]
+            if missing:
+                q, partial = quotes_mod.fetch_quotes(missing)
+                out.update(q)
+                if open_:
+                    ts = time.monotonic()
+                    for k, v in q.items():
+                        cache[k] = (ts, v)
+    return out, partial
 
 
 @app.get("/api/quotes")
@@ -624,23 +707,7 @@ def get_quotes(user=Depends(current_user), conn=Depends(get_conn)):
                              if str(r["market"]).startswith("us_")])):
         if not mrows:
             continue
-        codes = {str(r["code"]) for r in mrows}
-        if open_:
-            hit = _QUOTES_MEM.get(mkt)
-            if hit and time.monotonic() - hit[0] < _QUOTES_MEM_TTL:
-                out.update({k: v for k, v in hit[1].items() if k in codes})
-                partial = partial or hit[2]
-                continue
-        else:
-            snap = quotes_mod.market_snapshot(mkt)
-            if snap:
-                hit = {k: v for k, v in snap.items() if k in codes}
-                if hit:
-                    out.update(hit)
-                    continue
-        q, p = quotes_mod.fetch_quotes(mrows)
-        if open_:
-            _QUOTES_MEM[mkt] = (time.monotonic(), q, p)
+        q, p = _cached_quotes(mrows, mkt, open_)
         out.update(q)
         partial = partial or p
     return {"quotes": out, "partial": partial}
@@ -663,8 +730,8 @@ def instrument_detail(instrument_id: int, user=Depends(current_user),
         "SELECT * FROM instrument_status WHERE instrument_id = ?",
         (instrument_id,)).fetchone()
     events = conn.execute(
-        "SELECT id, ts, event_type, price, ma250, dist_pct, day_change_pct, "
-        "volume_ratio, note FROM events WHERE instrument_id = ? "
+        "SELECT id, ts, event_type, name, code, price, ma250, dist_pct, "
+        "day_change_pct, volume_ratio, note FROM events WHERE instrument_id = ? "
         "ORDER BY ts DESC, id DESC LIMIT 100", (instrument_id,)).fetchall()
     return {"item": dict(row), "status": dict(status) if status else None,
             "events": [dict(e) for e in events],
