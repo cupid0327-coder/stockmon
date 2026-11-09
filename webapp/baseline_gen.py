@@ -285,10 +285,11 @@ def _blob_load(key, max_age=None):
         return None
 
 
-def _seed_from_blob(cache, key, blob_key):
-    """重启暖启动：把库内最近值按真实年龄放回内存缓存（随后的 SWR 逻辑接管刷新）。"""
+def _seed_from_blob(cache, key, blob_key, accept=None):
+    """重启暖启动：把库内最近值按真实年龄放回内存缓存（随后的 SWR 逻辑接管刷新）。
+    accept(val) 为可选校验，不通过视为库内无可用值。"""
     got = _blob_load(blob_key, max_age=_BLOB_MAX_AGE)
-    if not got:
+    if not got or (accept is not None and not accept(got[0])):
         return False
     val, age = got
     cache[key] = (time.monotonic() - age, val)
@@ -693,7 +694,8 @@ def intraday_series(secid, sina_code=None, proxy_secid=None):
     """当日分时（SOX 走 SMH 代理 + 实时比值重标定）。
     开市：30s 新鲜；过期先回旧值并后台刷新（旧值最多供应 10 分钟）。
     闭市：曲线已冻结 → 15 分钟 TTL、旧值跨周末有效、不做后台刷新。
-    重启暖启动：先用 SQLite 最近快照立即返回；源全挂时回退库内当日快照；
+    重启暖启动：先用 SQLite 最近快照立即返回（开市时段仅限当日快照）；
+    源全挂时回退库内当日快照；
     失败负缓存 60s —— 快速失败，不在请求路径重演超时链。"""
     args = (secid, sina_code, proxy_secid)
     open_ = _market_open_for(secid)
@@ -706,7 +708,11 @@ def intraday_series(secid, sina_code=None, proxy_secid=None):
                              allow_refresh=open_)
 
     val, hit = _lookup()
-    if not hit and _seed_from_blob(_INTRADAY_CACHE, secid, "intra:" + secid):
+    # 开市时段只认当日快照：上一交易日的整条分时不可当作新鲜值回放
+    accept = ((lambda v: str((v or {}).get("date") or "")[:10]
+               == _session_date_for(secid)) if open_ else None)
+    if not hit and _seed_from_blob(_INTRADAY_CACHE, secid, "intra:" + secid,
+                                   accept=accept):
         val, hit = _lookup()
     if hit:
         if val is None:

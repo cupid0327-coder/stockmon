@@ -238,13 +238,17 @@ function countUp(el, to, digits, suffix) {
   requestAnimationFrame(frame);
 }
 function switchView(fromEl, toEl) {
+  const apply = () => {
+    if (fromEl) fromEl.classList.remove("is-active");
+    toEl.classList.add("is-active");
+  };
   if (document.startViewTransition && !REDUCED) {
-    document.startViewTransition(() => {
-      fromEl.classList.remove("is-active"); toEl.classList.add("is-active");
-    });
-  } else {
-    fromEl.classList.remove("is-active"); toEl.classList.add("is-active");
-  }
+    const t = document.startViewTransition(apply);
+    /* 连续切换 / 页面隐藏会让过渡 promise 以 InvalidStateError 拒绝，
+       但类名已由回调应用，忽略即可（否则控制台满是未处理拒绝） */
+    t.ready.catch(() => {});
+    t.finished.catch(() => {});
+  } else apply();
 }
 
 /* ---------------- auth ---------------- */
@@ -633,34 +637,41 @@ function renderSparks() {
     const c = cv.getContext("2d");
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.clearRect(0, 0, W, H);
-    let arr, base = null;
-    if (s.intraday && s.intraday.pts && s.intraday.pts.length >= 2) {
+    let arr, base = null, xs;
+    const intra = !!(s.intraday && s.intraday.pts && s.intraday.pts.length >= 2);
+    if (intra) {
+      /* 分时：固定时段轴（右侧留白，随时间向右生长）+ 对称昨收带宽 */
+      const ax = sessionAxis(s.market);
+      const slots = s.intraday.pts.map(pt => slotOf(pt[0], ax.sess));
       arr = s.intraday.pts.map(pt => pt[1]);
       base = s.intraday.preClose;
+      xs = (slots[slots.length - 1] - slots[0] < 1)
+        ? arr.map((_, i) => i / Math.max(1, arr.length - 1))
+        : slots.map(v => v / ax.total);
     } else {
       arr = s.series.slice(-90);
       base = arr[0];
+      xs = arr.map((_, i) => i / Math.max(1, arr.length - 1));
     }
-    /* 昨收基准虚线（分时模式） */
-    if (base != null && s.intraday) {
-      const lo = Math.min(...arr, base), hi = Math.max(...arr, base);
-      const span = (hi - lo) || 1;
-      const by = 3 + (H - 6) * (1 - (base - lo) / span);
+    const band = intra ? priceBand(arr, base)
+                       : { lo: Math.min(...arr, base), hi: Math.max(...arr, base) };
+    const span = (band.hi - band.lo) || 1;
+    const xOf = t => 2 + (W - 4) * t;
+    const yOf = v => 3 + (H - 6) * (1 - (v - band.lo) / span);
+    /* 昨收基准虚线（分时模式；带宽对称 → 恒在正中） */
+    if (intra) {
+      const by = yOf(base);
       c.setLineDash([2, 3]);
       c.strokeStyle = "rgba(234,231,224,.3)";
       c.beginPath(); c.moveTo(2, by); c.lineTo(W - 2, by); c.stroke();
       c.setLineDash([]);
     }
     const up = base != null ? arr[arr.length - 1] >= base : s.ret >= 0;
-    const lo = Math.min(...arr, base != null ? base : arr[0]);
-    const hi = Math.max(...arr, base != null ? base : arr[0]);
-    const span = (hi - lo) || 1;
     c.strokeStyle = up ? "rgba(255,84,73,.85)" : "rgba(46,194,126,.85)";
     c.lineWidth = 1.2;
     c.beginPath();
     arr.forEach((v, i) => {
-      const x = 2 + (W - 4) * i / Math.max(1, arr.length - 1);
-      const y = 3 + (H - 6) * (1 - (v - lo) / span);
+      const x = xOf(xs[i]), y = yOf(v);
       i ? c.lineTo(x, y) : c.moveTo(x, y);
     });
     c.stroke();
@@ -840,6 +851,58 @@ function marketPulse() {
   const cn = (mins >= 570 && mins < 690) || (mins >= 780 && mins < 900);
   const us = mins >= 1290 || mins < 240; /* 粗判，容忍冬夏令时 */
   return cn || us;
+}
+
+/* ---------------- 分时固定时段轴 ----------------
+   横轴按交易时段铺满全天，曲线只画到当前时刻、右侧留白（随时间向右生长）。
+   A股 09:30-11:30 / 13:00-15:00：午休折叠到同一刻度，全天 240 格；
+   美股 09:30-16:00 ET：390 格。刻度 = 时段内已走过的分钟数。 */
+const INTRADAY_SESSIONS = {
+  cn: [[570, 690], [780, 900]],
+  us: [[570, 960]],
+};
+function sessionKey(market) {
+  return String(market || "").startsWith("us_") ? "us" : "cn";
+}
+function sessionAxis(market) {
+  const sess = INTRADAY_SESSIONS[sessionKey(market)];
+  return { sess, total: sess.reduce((a, [s, e]) => a + (e - s), 0) };
+}
+function slotOf(hhmm, sess) {   /* "09:35" -> 刻度；时段外钳制到端点 */
+  const m = Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
+  let base = 0;
+  for (const [s, e] of sess) {
+    if (m <= e) return base + Math.max(0, Math.min(e - s, m - s));
+    base += e - s;
+  }
+  return base;
+}
+function slotTime(mins) {       /* 570 -> "09:30" */
+  const m = Math.round(mins);
+  return String(Math.floor(m / 60)).padStart(2, "0") + ":" +
+    String(m % 60).padStart(2, "0");
+}
+function axisLabels(sess) {
+  const first = sess[0], last = sess[sess.length - 1];
+  return {
+    left: slotTime(first[0]),
+    mid: sess.length > 1
+      ? slotTime(first[1]) + "/" + slotTime(sess[1][0])
+      : slotTime((first[0] + last[1]) / 2),
+    right: slotTime(last[1]),
+  };
+}
+/* 对称昨收带宽：以昨收为中心，取当日最大偏离上浮 12%，至少 ±0.5%，
+   向上取整到一档 —— 昨收虚线恒在正中，刷新不再上下跳。 */
+function niceStep(v) {
+  if (!(v > 0)) return 1;
+  const step = Math.pow(10, Math.floor(Math.log10(v)) - 1);
+  return Math.ceil(v / step) * step;
+}
+function priceBand(values, preClose) {
+  const dev = Math.max(...values.map(v => Math.abs(v - preClose)), 0);
+  const half = niceStep(Math.max(dev * 1.12, preClose * .005));
+  return { lo: preClose - half, hi: preClose + half };
 }
 async function pollQuotes() {
   try {
@@ -1173,7 +1236,6 @@ function renderChart(p = 1) {
   S._p = Math.min(1, p);
   const { cv, bars, ma250, ma5s, ma10s, cross } = S;
   const ctx = cv.getContext("2d");
-  ctx.setTransform(S.dpr, 0, 0, S.dpr, 0, 0);
   const W = S.W, H = S.H;
   const closes = bars.map(b => b.close);
   const extras = [ma250, ...(ma5s || []), ...(ma10s || [])]
@@ -1184,11 +1246,13 @@ function renderChart(p = 1) {
   const xAt = i => 8 + (W - 16) * (i / (n - 1));
   const yAt = v => 12 + (H - 62) * (1 - (v - lo) / (hi - lo));
   const lim = Math.floor((n - 1) * Math.min(1, p));
-  /* 画布位图必须与 CSS 尺寸×dpr 对齐，否则绘制会被裁剪在默认 300×150 里 */
+  /* 画布位图必须与 CSS 尺寸×dpr 对齐，否则绘制会被裁剪在默认 300×150 里。
+     改 width/height 会重置上下文（含 transform），所以必须先改尺寸再设 transform */
   const needW = Math.round(W * S.dpr), needH = Math.round(H * S.dpr);
   if (cv.width !== needW || cv.height !== needH) {
     cv.width = needW; cv.height = needH;
   }
+  ctx.setTransform(S.dpr, 0, 0, S.dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
 
   /* 横向网格（点状虚线，更轻） */
@@ -1321,7 +1385,39 @@ function renderChart(p = 1) {
   ctx.fillText(tl, W - 8 - ctx.measureText(tl).width, H - 1);
 }
 
+/* CSS 盒尺寸 → 绘制坐标系（面板隐藏时 clientWidth 为 0，保留上次的有效值） */
+function syncChartBox(S, fbW = 600, fbH = 240) {
+  S.dpr = Math.min(devicePixelRatio || 1, 2);
+  S.W = S.cv.clientWidth || S.W || fbW;
+  S.H = S.cv.clientHeight || S.H || fbH;
+}
+/* devicePixelRatio 变化（跨屏移动 / 系统缩放 / 浏览器缩放）时重画：
+   matchMedia 的 resolution 查询只在比值真的变了才触发，比值一变就按新 dpr 重新挂载 */
+function watchDpr(fn) {
+  if (typeof matchMedia !== "function") return;
+  matchMedia(`(resolution: ${devicePixelRatio}dppx)`)
+    .addEventListener("change", () => { watchDpr(fn); fn(); }, { once: true });
+}
+let chartRO = null, chartDprWatch = false;
 function attachChartInteractions(cv) {
+  /* 首帧常发生在详情面板尚不可见时（clientWidth 0 → 回退 600），位图会被拉伸；
+     面板一有真实尺寸就同步重画一次（与分时同一处理） */
+  if (!chartRO && typeof ResizeObserver !== "undefined") {
+    chartRO = new ResizeObserver(() => {
+      if (!chartState) return;
+      syncChartBox(chartState);
+      renderChart(chartState._p == null ? 1 : chartState._p);
+    });
+    chartRO.observe(cv);
+  }
+  if (!chartDprWatch) {
+    chartDprWatch = true;
+    watchDpr(() => {
+      if (!chartState) return;
+      syncChartBox(chartState);
+      renderChart(chartState._p == null ? 1 : chartState._p);
+    });
+  }
   cv.onmousemove = e => {
     if (!chartState) return;
     const rect = cv.getBoundingClientRect();
@@ -1358,8 +1454,9 @@ let intradayStarted = false;
 async function loadIntraday(id) {
   try {
     const d = await api(`/api/instruments/${id}/intraday`);
+    if (d.preClose == null && d.points.length) d.preClose = d.points[0][1];
     intradayState = { cv: $("#d-intraday"), ...d, cross: null };
-    renderIntraday(1);
+    renderIntraday();
     attachIntradayInteractions();
     $("#d-intraday-cap").textContent =
       `${d.date} 分时${d.source.includes("proxy") ? " · SMH代理重标定" : ""}` +
@@ -1368,24 +1465,32 @@ async function loadIntraday(id) {
     $("#d-intraday-cap").textContent = "分时数据不可用：" + e.message;
   }
 }
-function renderIntraday(p = 1) {
+function renderIntraday() {
   const S = intradayState;
   if (!S || !S.points.length) return;
   const cv = S.cv;
-  const dpr = Math.min(devicePixelRatio || 1, 2);
-  const W = S.W = cv.clientWidth || 600, H = S.H = cv.clientHeight || 220;
-  cv.width = W * dpr; cv.height = H * dpr;
+  syncChartBox(S, 600, 220);
+  const dpr = S.dpr, W = S.W, H = S.H;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
   const ctx = cv.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const prices = S.points.map(pt => pt[1]).slice(0, Math.max(2, Math.floor(S.points.length * p)));
-  const values = prices.concat([S.preClose]);
-  let lo = Math.min(...values), hi = Math.max(...values);
-  const pad = (hi - lo) * .12 || 1; lo -= pad; hi += pad;
   const n = S.points.length;
-  const xAt = i => 8 + (W - 16) * (i / (n - 1));
+  /* 横轴固定为全天时段：曲线只覆盖已走过的刻度，右侧留白 */
+  const ax = sessionAxis(S.market);
+  let slots = S.points.map(pt => slotOf(pt[0], ax.sess));
+  let total = ax.total, labels = axisLabels(ax.sess);
+  if (slots[n - 1] - slots[0] < 1) {   /* 数据源时段异常 → 退回按点数铺满 */
+    slots = S.points.map((_, i) => i);
+    total = Math.max(1, n - 1);
+    labels = { left: S.points[0][0], mid: "", right: S.points[n - 1][0] };
+  }
+  S.slots = slots; S.axisTotal = total; S.labels = labels;
+  const prices = S.points.map(pt => pt[1]);
+  const { lo, hi } = priceBand(prices, S.preClose);
+  const xAt = s => 8 + (W - 16) * (s / S.axisTotal);
   const yAt = v => 14 + (H - 44) * (1 - (v - lo) / (hi - lo));
   ctx.clearRect(0, 0, W, H);
-  /* 昨收基准虚线 */
+  /* 昨收基准虚线（带宽对称 → 恒在正中） */
   const py = yAt(S.preClose);
   ctx.setLineDash([4, 5]);
   ctx.strokeStyle = "rgba(234,231,224,.4)";
@@ -1394,31 +1499,31 @@ function renderIntraday(p = 1) {
   ctx.fillStyle = "rgba(234,231,224,.55)";
   ctx.font = "10px 'IBM Plex Mono', monospace";
   ctx.fillText("昨收 " + S.preClose.toFixed(2), 6, py - 5);
-  /* 价格平滑曲线（逐段按相对昨收着色） */
-  const last = Math.max(1, Math.floor((n - 1) * Math.min(1, p)) + (p < 1 ? 1 : 0));
-  for (let i = 1; i <= last; i++) {
+  /* 价格曲线（逐段按相对昨收着色） */
+  for (let i = 1; i < n; i++) {
     const up = S.points[i][1] >= S.preClose;
     ctx.strokeStyle = up ? "rgba(255,84,73,.9)" : "rgba(46,194,126,.9)";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ctx.moveTo(xAt(i - 1), yAt(S.points[i - 1][1]));
-    ctx.lineTo(xAt(i), yAt(S.points[i][1]));
+    ctx.moveTo(xAt(slots[i - 1]), yAt(S.points[i - 1][1]));
+    ctx.lineTo(xAt(slots[i]), yAt(S.points[i][1]));
     ctx.stroke();
   }
   /* 渐变区域（相对昨收） */
   ctx.beginPath();
-  ctx.moveTo(xAt(0), py);
-  for (let i = 0; i <= last; i++) ctx.lineTo(xAt(i), yAt(S.points[i][1]));
-  ctx.lineTo(xAt(last), py);
+  ctx.moveTo(xAt(slots[0]), py);
+  for (let i = 0; i < n; i++) ctx.lineTo(xAt(slots[i]), yAt(S.points[i][1]));
+  ctx.lineTo(xAt(slots[n - 1]), py);
   ctx.closePath();
-  const above = S.points[last][1] >= S.preClose;
-  const grad = ctx.createLinearGradient(0, Math.min(py, yAt(S.points[last][1])), 0, Math.max(py, yAt(S.points[last][1])));
+  const lastPx = S.points[n - 1][1];
+  const above = lastPx >= S.preClose;
+  const grad = ctx.createLinearGradient(0, Math.min(py, yAt(lastPx)), 0, Math.max(py, yAt(lastPx)));
   grad.addColorStop(0, above ? "rgba(255,84,73,.16)" : "rgba(46,194,126,.16)");
   grad.addColorStop(1, "rgba(0,0,0,0)");
   ctx.fillStyle = grad;
   ctx.fill();
   /* 末点辉光 */
-  const lp = { x: xAt(last), y: yAt(S.points[last][1]) };
+  const lp = { x: xAt(slots[n - 1]), y: yAt(lastPx) };
   const glow = ctx.createRadialGradient(lp.x, lp.y, 0, lp.x, lp.y, 11);
   glow.addColorStop(0, above ? "rgba(255,84,73,.55)" : "rgba(46,194,126,.55)");
   glow.addColorStop(1, "rgba(0,0,0,0)");
@@ -1426,22 +1531,56 @@ function renderIntraday(p = 1) {
   ctx.beginPath(); ctx.arc(lp.x, lp.y, 11, 0, 7); ctx.fill();
   ctx.fillStyle = above ? "#ff5449" : "#2ec27e";
   ctx.beginPath(); ctx.arc(lp.x, lp.y, 3, 0, 7); ctx.fill();
-  /* 时间轴 */
+  /* 十字线：悬停刻度竖虚线 + 该点标记（与日线图同一视觉语言） */
+  const ci = S.cross;
+  if (ci != null && ci >= 0 && ci < n) {
+    const cx = xAt(slots[ci]), cy = yAt(S.points[ci][1]);
+    ctx.strokeStyle = "rgba(234,231,224,.35)";
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath(); ctx.moveTo(cx, 10); ctx.lineTo(cx, H - 30); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(cx, cy, 3.4, 0, 7); ctx.fill();
+  }
+  /* 时间轴：固定时段端点（不随数据漂移） */
   ctx.fillStyle = "rgba(119,117,109,.9)";
   ctx.font = "10px 'IBM Plex Mono', monospace";
-  ctx.fillText(S.points[0][0], 6, H - 1);
-  const tm = S.points[n - 1][0];
-  ctx.fillText(tm, W - 6 - ctx.measureText(tm).width, H - 1);
+  ctx.textAlign = "left";
+  ctx.fillText(labels.left, 6, H - 1);
+  if (labels.mid) {
+    ctx.textAlign = "center";
+    ctx.fillText(labels.mid, W / 2, H - 1);
+  }
+  ctx.textAlign = "right";
+  ctx.fillText(labels.right, W - 6, H - 1);
+  ctx.textAlign = "left";
 }
+let intradayRO = null, intradayDprWatch = false;
 function attachIntradayInteractions() {
   const cv = intradayState.cv;
+  /* 首帧常发生在详情面板尚不可见时（clientWidth 0 → 回退 600），
+     位图会被拉伸；面板一有真实尺寸就重画一次 */
+  if (!intradayRO && typeof ResizeObserver !== "undefined") {
+    intradayRO = new ResizeObserver(() => { if (intradayState) renderIntraday(); });
+    intradayRO.observe(cv);
+  }
+  if (!intradayDprWatch) {
+    intradayDprWatch = true;
+    watchDpr(() => { if (intradayState) renderIntraday(); });
+  }
   cv.onmousemove = e => {
     if (!intradayState) return;
     const rect = cv.getBoundingClientRect();
-    const idx = Math.round((e.clientX - rect.left - 8) / (rect.width - 16)
-                           * (intradayState.points.length - 1));
-    intradayState.cross = Math.max(0, Math.min(intradayState.points.length - 1, idx));
-    renderIntraday(1);
+    /* clientX -> 刻度 -> 最近的数据点（右侧留白处落在末点） */
+    const target = (e.clientX - rect.left - 8) / Math.max(1, rect.width - 16)
+                   * intradayState.axisTotal;
+    let idx = 0, best = Infinity;
+    intradayState.slots.forEach((s, i) => {
+      const dist = Math.abs(s - target);
+      if (dist < best) { best = dist; idx = i; }
+    });
+    intradayState.cross = idx;
+    renderIntraday();
     const [tm, pr] = intradayState.points[intradayState.cross];
     const chg = intradayState.preClose ? (pr / intradayState.preClose * 100 - 100) : null;
     const tip = document.querySelector("#intraday-tip");
@@ -1456,7 +1595,7 @@ function attachIntradayInteractions() {
   cv.onmouseleave = () => {
     if (!intradayState) return;
     intradayState.cross = null;
-    renderIntraday(1);
+    renderIntraday();
     const tip = document.querySelector("#intraday-tip");
     if (tip) tip.hidden = true;
   };
@@ -1764,13 +1903,10 @@ function initChrome() {
   }));
   $("#detail-back").addEventListener("click", () => nav(prevNav || "dashboard"));
   addEventListener("resize", () => {
-    if (currentNav !== "detail" || !chartState) return;
-    const cv = chartState.cv;
-    chartState.dpr = Math.min(devicePixelRatio || 1, 2);
-    chartState.W = cv.clientWidth || 600;
-    chartState.H = cv.clientHeight || 240;
-    cv.width = chartState.W * chartState.dpr;
-    cv.height = chartState.H * chartState.dpr;
+    if (currentNav !== "detail") return;
+    if (intradayState) renderIntraday();
+    if (!chartState) return;
+    syncChartBox(chartState);
     renderChart(chartState._p == null ? 1 : chartState._p);
   });
   $("#btn-logout").addEventListener("click", async () => {

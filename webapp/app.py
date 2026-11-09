@@ -463,6 +463,7 @@ def backdrop(user=Depends(current_user), conn=Depends(get_conn)):
             lo, hi = min(closes), max(closes)
             span = (hi - lo) or 1.0
             entry = {"code": r["code"], "name": r["name"],
+                     "market": r["market"],
                      "ret": round(closes[-1] / closes[0] - 1, 4),
                      "series": [round((c - lo) / span, 4) for c in closes],
                      "intraday": None}
@@ -581,7 +582,8 @@ def instrument_intraday(instrument_id: int, user=Depends(current_user),
                                             proxy_secid=proxy)
     except Exception as e:
         raise HTTPException(502, f"分时数据源请求失败：{e}")
-    return {**data, "name": row["name"], "code": row["code"]}
+    return {**data, "name": row["name"], "code": row["code"],
+            "market": row["market"]}
 
 
 # ---------- catalog / live quotes / detail ----------
